@@ -1,0 +1,266 @@
+{
+  "entities": {
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Trusted registry of tax firm staff with administrative access.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "createdAt"]
+    },
+    "TaxClient": {
+      "title": "TaxClient",
+      "description": "A Malaysia personal tax client engagement record for a specific Year of Assessment.",
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "phone": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 32
+        },
+        "taxYear": {
+          "type": "integer",
+          "description": "Year of Assessment (e.g. 2026)"
+        },
+        "filingCategory": {
+          "type": "string",
+          "enum": ["Form BE (Salaried)", "Form B (Business / Commission)", "Form M (Non-Resident)"]
+        },
+        "jobStatus": {
+          "type": "string",
+          "enum": ["No Book In", "Pending Document", "Book In Can Start"]
+        },
+        "isLocked": {
+          "type": "boolean",
+          "description": "Locks document once handed off for LHDN computation; only admins can modify locked records."
+        },
+        "reminderCount": {
+          "type": "integer"
+        },
+        "lastReminderSent": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "latestReminderDraft": {
+          "type": "string",
+          "maxLength": 2500
+        },
+        "requiredDocuments": {
+          "type": "array",
+          "description": "Bounded list (max 20) of required Malaysian tax documents and verification statuses."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "clientId",
+        "ownerUid",
+        "name",
+        "email",
+        "phone",
+        "taxYear",
+        "filingCategory",
+        "jobStatus",
+        "isLocked",
+        "reminderCount",
+        "latestReminderDraft",
+        "requiredDocuments",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DocumentVerification": {
+      "title": "DocumentVerification",
+      "description": "Immutable audit record of a Gemini 2.5 Flash multimodal verification run on uploaded tax documents.",
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clientOwnerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clientEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "submittedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recommendedJobStatus": {
+          "type": "string",
+          "enum": ["No Book In", "Pending Document", "Book In Can Start"]
+        },
+        "automatedReminderDraft": {
+          "type": "string",
+          "maxLength": 2500
+        },
+        "detectedDocuments": {
+          "type": "array",
+          "description": "Bounded list (max 20) of Gemini-classified tax documents."
+        },
+        "missingDocuments": {
+          "type": "array",
+          "description": "Bounded list (max 20) of missing document category names."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "clientId",
+        "clientOwnerUid",
+        "clientEmail",
+        "submittedByUid",
+        "recommendedJobStatus",
+        "automatedReminderDraft",
+        "detectedDocuments",
+        "missingDocuments",
+        "createdAt"
+      ]
+    },
+    "ReminderLog": {
+      "title": "ReminderLog",
+      "description": "Immutable audit record of an outreach or missing-document reminder dispatched to a taxpayer.",
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clientOwnerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clientEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "sentByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "stage": {
+          "type": "string",
+          "enum": ["Initial Outreach", "7-Day Follow-up", "Missing Doc Alert", "Ready for Tax Prep"]
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["Email", "WhatsApp", "Portal"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2500
+        },
+        "missingDocuments": {
+          "type": "array",
+          "description": "Bounded list (max 20) of missing documents cited in the reminder."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "clientId",
+        "clientOwnerUid",
+        "clientEmail",
+        "sentByUid",
+        "stage",
+        "channel",
+        "message",
+        "missingDocuments",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Trusted staff admin accounts."
+    },
+    "/clients/{clientId}": {
+      "schema": { "$ref": "#/entities/TaxClient" },
+      "description": "Personal tax client profiles, required document checklists, and automated job statuses."
+    },
+    "/clients/{clientId}/verifications/{verificationId}": {
+      "schema": { "$ref": "#/entities/DocumentVerification" },
+      "description": "Audit trail of Gemini 2.5 Flash document verification runs for a client."
+    },
+    "/clients/{clientId}/reminders/{reminderId}": {
+      "schema": { "$ref": "#/entities/ReminderLog" },
+      "description": "Audit trail of automated and manual follow-up reminders dispatched for a client."
+    }
+  }
+}
