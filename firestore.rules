@@ -188,6 +188,92 @@ service cloud.firestore {
       data.updatedAt is timestamp;
     }
 
+    function isValidAppConfigSettings(data) {
+      return data.keys().hasAll([
+        'activeTaxYear',
+        'reminderIntervalDays',
+        'defaultTemplates',
+        'updatedByUid',
+        'updatedByEmail',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'activeTaxYear',
+        'reminderIntervalDays',
+        'defaultTemplates',
+        'updatedByUid',
+        'updatedByEmail',
+        'updatedAt'
+      ]) &&
+      data.activeTaxYear is int &&
+      data.activeTaxYear >= 2020 &&
+      data.activeTaxYear <= 2035 &&
+      data.reminderIntervalDays is int &&
+      data.reminderIntervalDays >= 1 &&
+      data.reminderIntervalDays <= 60 &&
+      data.defaultTemplates is map &&
+      isValidId(data.updatedByUid) &&
+      isValidEmailStr(data.updatedByEmail) &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidGovernanceChangeRequest(data) {
+      return data.keys().hasAll([
+        'category',
+        'targetCollection',
+        'targetDocId',
+        'targetLabel',
+        'operation',
+        'proposedPayload',
+        'reason',
+        'requestedByUid',
+        'requestedByEmail',
+        'requestedByRole',
+        'status',
+        'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'category',
+        'targetCollection',
+        'targetDocId',
+        'targetLabel',
+        'operation',
+        'proposedPayload',
+        'previousSummary',
+        'reason',
+        'requestedByUid',
+        'requestedByEmail',
+        'requestedByRole',
+        'status',
+        'createdAt',
+        'reviewedByUid',
+        'reviewedByEmail',
+        'reviewedAt',
+        'reviewNote'
+      ]) &&
+      data.category in ['CLIENT_DB_CHANGE', 'APP_CONFIG_CHANGE', 'ROLE_ELEVATION', 'TWO_FACTOR_CHANGE'] &&
+      data.targetCollection in ['clients', 'system_settings', 'users'] &&
+      isValidId(data.targetDocId) &&
+      data.targetLabel is string &&
+      data.targetLabel.size() >= 1 &&
+      data.targetLabel.size() <= 200 &&
+      data.operation in ['CREATE', 'UPDATE', 'DELETE'] &&
+      data.proposedPayload is map &&
+      (!('previousSummary' in data) || data.previousSummary == null || (data.previousSummary is string && data.previousSummary.size() <= 1000)) &&
+      data.reason is string &&
+      data.reason.size() >= 10 &&
+      data.reason.size() <= 600 &&
+      isValidId(data.requestedByUid) &&
+      isValidEmailStr(data.requestedByEmail) &&
+      data.requestedByRole in ['administrator', 'manager', 'user'] &&
+      data.status in ['PENDING', 'APPROVED', 'REJECTED'] &&
+      data.createdAt is timestamp &&
+      (!('reviewedByUid' in data) || data.reviewedByUid == null || isValidId(data.reviewedByUid)) &&
+      (!('reviewedByEmail' in data) || data.reviewedByEmail == null || isValidEmailStr(data.reviewedByEmail)) &&
+      (!('reviewedAt' in data) || data.reviewedAt == null || data.reviewedAt is timestamp) &&
+      (!('reviewNote' in data) || data.reviewNote == null || (data.reviewNote is string && data.reviewNote.size() <= 500));
+    }
+
     // -------------------------------------------------------------------------
     // Collection: /users/{uid}
     // -------------------------------------------------------------------------
@@ -298,6 +384,55 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
+    // Collection: /change_requests/{requestId} (Unified Governance Queue)
+    // -------------------------------------------------------------------------
+    match /change_requests/{requestId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        (isAdmin() || existing().requestedByUid == request.auth.uid);
+
+      allow list: if isAdmin() || (
+        isVerifiedUser() &&
+        existing().requestedByUid == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        isValidGovernanceChangeRequest(incoming()) &&
+        incoming().requestedByUid == request.auth.uid &&
+        incoming().requestedByEmail.lower() == request.auth.token.email.lower() &&
+        incoming().status == 'PENDING' &&
+        incoming().createdAt == request.time &&
+        (!('reviewedByUid' in incoming()) || incoming().reviewedByUid == null) &&
+        (!('reviewedByEmail' in incoming()) || incoming().reviewedByEmail == null) &&
+        (!('reviewedAt' in incoming()) || incoming().reviewedAt == null) &&
+        (!('reviewNote' in incoming()) || incoming().reviewNote == null);
+
+      allow update: if isAdmin() &&
+        isValidId(requestId) &&
+        isValidGovernanceChangeRequest(incoming()) &&
+        existing().status == 'PENDING' &&
+        incoming().status in ['APPROVED', 'REJECTED'] &&
+        incoming().category == existing().category &&
+        incoming().targetCollection == existing().targetCollection &&
+        incoming().targetDocId == existing().targetDocId &&
+        incoming().targetLabel == existing().targetLabel &&
+        incoming().operation == existing().operation &&
+        incoming().proposedPayload == existing().proposedPayload &&
+        incoming().reason == existing().reason &&
+        incoming().requestedByUid == existing().requestedByUid &&
+        incoming().requestedByEmail == existing().requestedByEmail &&
+        incoming().requestedByRole == existing().requestedByRole &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().reviewedByUid == request.auth.uid &&
+        incoming().reviewedByEmail.lower() == request.auth.token.email.lower() &&
+        incoming().reviewedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedByUid', 'reviewedByEmail', 'reviewedAt', 'reviewNote']);
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
     // Collection: /system_settings/{settingId}
     // -------------------------------------------------------------------------
     match /system_settings/{settingId} {
@@ -306,14 +441,20 @@ service cloud.firestore {
 
       allow create: if isAdmin() &&
         isValidId(settingId) &&
-        isValidSecuritySettings(incoming()) &&
+        (
+          (settingId == 'security' && isValidSecuritySettings(incoming())) ||
+          (settingId == 'app_config' && isValidAppConfigSettings(incoming()))
+        ) &&
         incoming().updatedByUid == request.auth.uid &&
         incoming().updatedByEmail.lower() == request.auth.token.email.lower() &&
         incoming().updatedAt == request.time;
 
       allow update: if isAdmin() &&
         isValidId(settingId) &&
-        isValidSecuritySettings(incoming()) &&
+        (
+          (settingId == 'security' && isValidSecuritySettings(incoming())) ||
+          (settingId == 'app_config' && isValidAppConfigSettings(incoming()))
+        ) &&
         incoming().updatedByUid == request.auth.uid &&
         incoming().updatedByEmail.lower() == request.auth.token.email.lower() &&
         incoming().updatedAt == request.time;
@@ -352,18 +493,24 @@ service cloud.firestore {
         (existing().ownerUid == request.auth.uid || existing().email == request.auth.token.email)
       );
 
-      allow create: if isVerifiedUser() &&
-        isValidId(clientId) &&
-        (isStaffOrManager() || incoming().ownerUid == request.auth.uid);
+      allow create: if isAdmin() && isValidId(clientId);
 
       allow update: if isVerifiedUser() &&
         isValidId(clientId) &&
         (
-          isStaffOrManager() ||
+          isAdmin() ||
+          (
+            isManager() &&
+            (
+              incoming().diff(existing()).affectedKeys().hasOnly(['lastReminderSent', 'reminderCount', 'latestReminderDraft', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['requiredDocuments', 'jobStatus', 'latestReminderDraft', 'updatedAt'])
+            )
+          ) ||
           (
             existing().isLocked == false &&
             incoming().isLocked == false &&
-            isClientOwner(existing())
+            isClientOwner(existing()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['requiredDocuments', 'jobStatus', 'latestReminderDraft', 'updatedAt'])
           )
         );
 

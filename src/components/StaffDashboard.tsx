@@ -10,17 +10,21 @@ import {
 } from 'lucide-react';
 import type { JobStatus, TaxClient, UserProfile, UserRole } from '../types/tax';
 import { assignClientToStaff, determineWorkflowStage } from '../lib/taxService';
+import { submitGovernanceChangeRequest } from '../lib/governanceService';
 import { logActivity } from '../lib/auditService';
 import { JobStatusText } from './StatusIndicator';
+import { GovernanceReasonModal } from './GovernanceReasonModal';
 
 interface StaffDashboardProps {
   clients: TaxClient[];
   loading: boolean;
   userRole: UserRole;
   staffProfiles: UserProfile[];
+  reminderIntervalDays?: number;
   onSelectClient: (clientId: string) => void;
   onOpenNewClient: () => void;
   onGoToReminders: (clientId?: string) => void;
+  onGovernanceSubmitted: (message: string) => void;
 }
 
 type StatusFilter = 'All' | JobStatus;
@@ -30,14 +34,22 @@ export function StaffDashboard({
   loading,
   userRole,
   staffProfiles,
+  reminderIntervalDays = 7,
   onSelectClient,
   onOpenNewClient,
   onGoToReminders,
+  onGovernanceSubmitted,
 }: StaffDashboardProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const [yearFilter, setYearFilter] = useState<string>('All');
   const [assigningId, setAssigningId] = useState<string | null>(null);
+  const [pendingAssign, setPendingAssign] = useState<{
+    client: TaxClient;
+    nextStaff: { uid: string; name: string; email: string } | null;
+    summary: string;
+  } | null>(null);
+  const [stagingError, setStagingError] = useState<string | null>(null);
 
   const years = useMemo(() => {
     const unique = Array.from(new Set(clients.map((c) => c.taxYear))).sort((a, b) => b - a);
@@ -49,9 +61,11 @@ export function StaffDashboard({
     const noBookIn = clients.filter((c) => c.jobStatus === 'No Book In').length;
     const pendingDoc = clients.filter((c) => c.jobStatus === 'Pending Document').length;
     const ready = clients.filter((c) => c.jobStatus === 'Book In Can Start').length;
-    const overdue = clients.filter((c) => determineWorkflowStage(c).isEscalated).length;
+    const overdue = clients.filter(
+      (c) => determineWorkflowStage(c, reminderIntervalDays).isEscalated
+    ).length;
     return { total, noBookIn, pendingDoc, ready, overdue };
-  }, [clients]);
+  }, [clients, reminderIntervalDays]);
 
   const filteredClients = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -70,34 +84,67 @@ export function StaffDashboard({
   }, [clients, searchQuery, statusFilter, yearFilter]);
 
   const handleStaffAssignment = async (clientId: string, staffUid: string) => {
-    setAssigningId(clientId);
     const targetClient = clients.find((c) => c.clientId === clientId);
-    const previousAssignee = targetClient?.assignedTo?.email || 'Unassigned';
+    if (!targetClient) return;
+
+    const previousAssignee = targetClient.assignedTo?.email || 'Unassigned';
+    const found = staffUid ? staffProfiles.find((p) => p.uid === staffUid) : null;
+    const nextStaff = found
+      ? { uid: found.uid, name: found.displayName, email: found.email }
+      : null;
+
+    if (userRole !== 'administrator') {
+      setStagingError(null);
+      setPendingAssign({
+        client: targetClient,
+        nextStaff,
+        summary: `Assigned Staff: ${previousAssignee} -> ${nextStaff ? `${nextStaff.name} (${nextStaff.email})` : 'Unassigned'}`,
+      });
+      return;
+    }
+
+    setAssigningId(clientId);
     try {
-      if (!staffUid) {
-        await assignClientToStaff(clientId, null);
-        void logActivity({
-          pageVisited: 'Staff Dashboard',
-          actionTaken: 'ASSIGN_DUTY',
-          details: `Unassigned client ${clientId} (${targetClient?.name || 'Unknown'}) — previously assigned to ${previousAssignee}.`,
-        });
-      } else {
-        const found = staffProfiles.find((p) => p.uid === staffUid);
-        if (found) {
-          await assignClientToStaff(clientId, {
-            uid: found.uid,
-            name: found.displayName,
-            email: found.email,
-          });
-          void logActivity({
-            pageVisited: 'Staff Dashboard',
-            actionTaken: 'ASSIGN_DUTY',
-            details: `Assigned client ${clientId} (${targetClient?.name || 'Unknown'}) to ${found.displayName} (${found.email}, ${found.role}) — previously ${previousAssignee}.`,
-          });
-        }
-      }
+      await assignClientToStaff(clientId, nextStaff);
+      void logActivity({
+        pageVisited: 'Staff Dashboard',
+        actionTaken: 'ASSIGN_DUTY',
+        details: nextStaff
+          ? `Assigned client ${clientId} (${targetClient.name}) to ${nextStaff.name} (${nextStaff.email}) — previously ${previousAssignee}.`
+          : `Unassigned client ${clientId} (${targetClient.name}) — previously assigned to ${previousAssignee}.`,
+      });
     } catch (err) {
       console.error('Failed to assign staff:', err);
+    } finally {
+      setAssigningId(null);
+    }
+  };
+
+  const handleConfirmStagedAssignment = async (reason: string) => {
+    if (!pendingAssign) return;
+    setAssigningId(pendingAssign.client.clientId);
+    setStagingError(null);
+    try {
+      await submitGovernanceChangeRequest({
+        category: 'CLIENT_DB_CHANGE',
+        targetCollection: 'clients',
+        targetDocId: pendingAssign.client.clientId,
+        targetLabel: `${pendingAssign.client.clientId} — ${pendingAssign.client.name}`,
+        operation: 'UPDATE',
+        proposedPayload: { assignedTo: pendingAssign.nextStaff },
+        previousSummary: pendingAssign.summary,
+        reason,
+        requestedByRole: userRole,
+        pageVisited: 'Staff Dashboard',
+      });
+      setPendingAssign(null);
+      onGovernanceSubmitted(
+        'Submitted to Danger Zone — awaiting System Administrator approval.'
+      );
+    } catch (err) {
+      setStagingError(
+        err instanceof Error ? err.message : 'Failed to submit duty assignment request.'
+      );
     } finally {
       setAssigningId(null);
     }
@@ -290,7 +337,7 @@ export function StaffDashboard({
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
                 {filteredClients.map((client) => {
-                  const workflow = determineWorkflowStage(client);
+                  const workflow = determineWorkflowStage(client, reminderIntervalDays);
                   const activeStaffList = staffProfiles.filter(
                     (p) => p.role === 'administrator' || p.role === 'manager'
                   );
@@ -402,6 +449,23 @@ export function StaffDashboard({
           </div>
         )}
       </section>
+
+      {pendingAssign && (
+        <GovernanceReasonModal
+          title="Administrator Approval Required: Duty Assignment"
+          description="Reassigning client duties requires System Administrator approval. Provide a justification to stage this CLIENT_DB_CHANGE request in the Danger Zone."
+          targetLabel={`${pendingAssign.client.clientId} — ${pendingAssign.client.name}`}
+          previousSummary={pendingAssign.summary}
+          confirmLabel="Submit to Danger Zone"
+          submitting={assigningId === pendingAssign.client.clientId}
+          error={stagingError}
+          onCancel={() => {
+            setPendingAssign(null);
+            setStagingError(null);
+          }}
+          onConfirm={handleConfirmStagedAssignment}
+        />
+      )}
     </div>
   );
 }

@@ -43,6 +43,11 @@ const ACTION_LABELS: Record<string, string> = {
   COMPLETE_2FA_CHANGE: '2FA Change Completed',
   UPDATE_SECURITY_POLICY: 'Security Policy Update',
   DANGER_DELETE_CLIENT: 'Permanent Client Purge',
+  SUBMIT_GOVERNANCE_CHANGE: 'Governance Request Submitted',
+  APPROVE_GOVERNANCE_CHANGE: 'Governance Change Approved & Applied',
+  REJECT_GOVERNANCE_CHANGE: 'Governance Change Rejected',
+  UPDATE_APP_CONFIG: 'App Configuration Update',
+  UPDATE_CLIENT_PROFILE: 'Client Profile Update',
 };
 
 function getActionTone(action: string): string {
@@ -51,19 +56,24 @@ function getActionTone(action: string): string {
     case 'DANGER_DELETE_CLIENT':
     case 'UPDATE_USER_ROLE':
     case 'REJECT_2FA_CHANGE':
+    case 'REJECT_GOVERNANCE_CHANGE':
       return 'text-red-700';
     case 'JOB_STATUS_CHANGE':
     case 'AI_DOCUMENT_VERIFICATION':
     case 'UPLOAD_TAX_DOCUMENT':
     case 'APPROVE_2FA_CHANGE':
     case 'COMPLETE_2FA_CHANGE':
+    case 'APPROVE_GOVERNANCE_CHANGE':
+    case 'UPDATE_CLIENT_PROFILE':
       return 'text-teal-800';
     case 'DISPATCH_REMINDER':
     case 'ASSIGN_DUTY':
     case 'CREATE_CLIENT':
     case 'AUTO_LOGOUT_IDLE':
     case 'REQUEST_2FA_CHANGE':
+    case 'SUBMIT_GOVERNANCE_CHANGE':
     case 'UPDATE_SECURITY_POLICY':
+    case 'UPDATE_APP_CONFIG':
       return 'text-amber-700';
     case 'EXPORT_AUDIT_LOG':
       return 'text-indigo-700';

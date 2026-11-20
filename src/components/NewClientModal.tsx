@@ -1,48 +1,72 @@
 import React, { useState } from 'react';
-import { X, Plus, Trash2 } from 'lucide-react';
+import { X, Plus, Trash2, ShieldAlert } from 'lucide-react';
 import {
   ALL_STANDARD_DOC_TYPES,
   BLUEPRINT_LIMITS,
   MALAYSIA_DOC_PRESETS,
+  type AppConfigSettings,
   type FilingCategory,
+  type UserRole,
 } from '../types/tax';
-import { createTaxClient, sanitizeClientId } from '../lib/taxService';
+import { auth } from '../lib/firebase';
+import {
+  buildCreateTaxClientPayload,
+  createTaxClient,
+  sanitizeClientId,
+} from '../lib/taxService';
+import { submitGovernanceChangeRequest } from '../lib/governanceService';
 import { logActivity } from '../lib/auditService';
+import { GovernanceReasonModal } from './GovernanceReasonModal';
 
 interface NewClientModalProps {
+  userRole: UserRole;
+  appConfig?: AppConfigSettings;
   defaultEmail?: string;
   defaultName?: string;
   lockEmailToUser?: boolean;
   existingIds: string[];
   onClose: () => void;
   onCreated: (clientId: string) => void;
+  onGovernanceSubmitted: (message: string) => void;
 }
 
 export function NewClientModal({
+  userRole,
+  appConfig,
   defaultEmail = '',
   defaultName = '',
   lockEmailToUser = false,
   existingIds,
   onClose,
   onCreated,
+  onGovernanceSubmitted,
 }: NewClientModalProps) {
+  const isAdmin = userRole === 'administrator';
+  const defaultYear = appConfig?.activeTaxYear ?? 2026;
+  const presets = appConfig?.defaultTemplates ?? MALAYSIA_DOC_PRESETS;
+
   const suggestedNum = String(existingIds.length + 102).padStart(3, '0');
-  const [clientId, setClientId] = useState(`TAX-2026-${suggestedNum}`);
+  const [clientId, setClientId] = useState(`TAX-${defaultYear}-${suggestedNum}`);
   const [name, setName] = useState(defaultName);
   const [email, setEmail] = useState(defaultEmail);
   const [phone, setPhone] = useState('+6012');
-  const [taxYear, setTaxYear] = useState(2026);
+  const [taxYear, setTaxYear] = useState(defaultYear);
   const [filingCategory, setFilingCategory] = useState<FilingCategory>('Form BE (Salaried)');
   const [docTypes, setDocTypes] = useState<string[]>([
-    ...MALAYSIA_DOC_PRESETS['Form BE (Salaried)'],
+    ...(presets['Form BE (Salaried)'] || MALAYSIA_DOC_PRESETS['Form BE (Salaried)']),
   ]);
   const [customDoc, setCustomDoc] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<{
+    clientId: string;
+    payload: Record<string, unknown>;
+    summary: string;
+  } | null>(null);
 
   const handleCategoryChange = (cat: FilingCategory) => {
     setFilingCategory(cat);
-    setDocTypes([...MALAYSIA_DOC_PRESETS[cat]]);
+    setDocTypes([...(presets[cat] || MALAYSIA_DOC_PRESETS[cat])]);
   };
 
   const handleAddDoc = (docName: string) => {
@@ -79,6 +103,32 @@ export function NewClientModal({
       return;
     }
 
+    if (!isAdmin) {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        setError('You must be signed in to submit a client creation request.');
+        return;
+      }
+      const built = buildCreateTaxClientPayload(
+        {
+          clientId: cleanId,
+          name,
+          email,
+          phone,
+          taxYear,
+          filingCategory,
+          docTypes,
+        },
+        uid
+      );
+      setPendingApproval({
+        clientId: built.clientId,
+        payload: built.payload,
+        summary: `New Client: ${name.trim()} (${email.trim().toLowerCase()}), ${filingCategory}, YA ${taxYear}, ${docTypes.length} required document(s).`,
+      });
+      return;
+    }
+
     setSubmitting(true);
     try {
       const createdId = await createTaxClient({
@@ -98,6 +148,36 @@ export function NewClientModal({
       onCreated(createdId);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create tax file.');
+      setSubmitting(false);
+    }
+  };
+
+  const handleConfirmGovernanceCreate = async (reason: string) => {
+    if (!pendingApproval) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await submitGovernanceChangeRequest({
+        category: 'CLIENT_DB_CHANGE',
+        targetCollection: 'clients',
+        targetDocId: pendingApproval.clientId,
+        targetLabel: `${pendingApproval.clientId} — ${name.trim()}`,
+        operation: 'CREATE',
+        proposedPayload: pendingApproval.payload,
+        previousSummary: pendingApproval.summary,
+        reason,
+        requestedByRole: userRole,
+        pageVisited: 'New Client Modal',
+      });
+      setPendingApproval(null);
+      onGovernanceSubmitted(
+        'Submitted to Danger Zone — awaiting System Administrator approval.'
+      );
+      onClose();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Failed to submit client creation request.'
+      );
       setSubmitting(false);
     }
   };
@@ -134,6 +214,17 @@ export function NewClientModal({
         </div>
 
         <form onSubmit={handleSubmit} className="overflow-y-auto p-6 space-y-5">
+          {!isAdmin && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-start gap-2">
+              <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <span>
+                As a non-administrator (<span className="capitalize font-medium">{userRole}</span>),
+                submitting this form stages a <span className="font-semibold">CLIENT_DB_CHANGE</span>{' '}
+                request in the Danger Zone for System Administrator approval.
+              </span>
+            </div>
+          )}
+
           {error && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
               {error}
@@ -319,11 +410,32 @@ export function NewClientModal({
               disabled={submitting}
               className="px-4 py-2 text-sm font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 transition-colors cursor-pointer"
             >
-              {submitting ? 'Creating File...' : 'Create Tax File'}
+              {submitting
+                ? 'Submitting...'
+                : isAdmin
+                  ? 'Create Tax File'
+                  : 'Request Client Creation'}
             </button>
           </div>
         </form>
       </div>
+
+      {pendingApproval && (
+        <GovernanceReasonModal
+          title="Administrator Approval Required: Create Client"
+          description="Creating a new client record requires System Administrator approval. Provide a clear justification to stage this request in the Danger Zone."
+          targetLabel={`${pendingApproval.clientId} — ${name.trim()}`}
+          previousSummary={pendingApproval.summary}
+          confirmLabel="Submit to Danger Zone"
+          submitting={submitting}
+          error={error}
+          onCancel={() => {
+            setPendingApproval(null);
+            setSubmitting(false);
+          }}
+          onConfirm={handleConfirmGovernanceCreate}
+        />
+      )}
     </div>
   );
 }

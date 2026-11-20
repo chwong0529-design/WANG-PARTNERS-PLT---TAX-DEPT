@@ -84,13 +84,17 @@ export function getDaysSince(ts: Timestamp | null | undefined): number | null {
   return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
 }
 
-export function determineWorkflowStage(client: TaxClient): {
+export function determineWorkflowStage(
+  client: TaxClient,
+  reminderIntervalDays = 7
+): {
   stage: ReminderStage;
   isEscalated: boolean;
   daysSinceReminder: number | null;
   summary: string;
 } {
   const days = getDaysSince(client.lastReminderSent);
+  const threshold = Math.max(1, reminderIntervalDays);
   if (client.jobStatus === 'Book In Can Start') {
     return {
       stage: 'Ready for Tax Prep',
@@ -103,7 +107,7 @@ export function determineWorkflowStage(client: TaxClient): {
     const missingCount = client.requiredDocuments.filter((d) => d.status !== 'Verified').length;
     return {
       stage: 'Missing Doc Alert',
-      isEscalated: days !== null && days >= 7,
+      isEscalated: days !== null && days >= threshold,
       daysSinceReminder: days,
       summary: `${missingCount} required document${missingCount === 1 ? '' : 's'} still pending verification.`,
     };
@@ -117,13 +121,13 @@ export function determineWorkflowStage(client: TaxClient): {
       summary: 'Awaiting initial tax season invitation with client checklist.',
     };
   }
-  const escalated = (days ?? 0) >= 7;
+  const escalated = (days ?? 0) >= threshold;
   return {
     stage: '7-Day Follow-up',
     isEscalated: escalated,
     daysSinceReminder: days,
     summary: escalated
-      ? `No uploads after ${days} days — overdue for 7-day follow-up.`
+      ? `No uploads after ${days} days — overdue for ${threshold}-day follow-up.`
       : `Invited ${days} day${days === 1 ? '' : 's'} ago — awaiting first upload.`,
   };
 }
@@ -413,12 +417,11 @@ export interface CreateClientInput {
   docTypes: string[];
 }
 
-export async function createTaxClient(input: CreateClientInput): Promise<string> {
-  const user = auth.currentUser;
-  if (!user) throw new Error('You must be signed in to create a tax file.');
-
+export function buildCreateTaxClientPayload(
+  input: CreateClientInput,
+  ownerUid: string
+): { clientId: string; payload: Record<string, unknown> } {
   const clientId = sanitizeClientId(input.clientId);
-  const path = `clients/${clientId}`;
   const requiredDocuments: RequiredDocumentItem[] = input.docTypes
     .map((t) => clampString(t, 120))
     .filter(Boolean)
@@ -439,9 +442,9 @@ export async function createTaxClient(input: CreateClientInput): Promise<string>
     Math.max(BLUEPRINT_LIMITS.TAX_YEAR_MIN, Math.round(input.taxYear))
   );
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     clientId,
-    ownerUid: user.uid,
+    ownerUid,
     name: clampString(input.name, BLUEPRINT_LIMITS.NAME_MAX),
     email: normalizedEmail,
     phone: clampString(input.phone, BLUEPRINT_LIMITS.PHONE_MAX),
@@ -457,15 +460,55 @@ export async function createTaxClient(input: CreateClientInput): Promise<string>
     ),
     assignedTo: null,
     requiredDocuments,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
   };
 
+  return { clientId, payload };
+}
+
+export async function createTaxClient(input: CreateClientInput): Promise<string> {
+  const user = auth.currentUser;
+  if (!user) throw new Error('You must be signed in to create a tax file.');
+
+  const { clientId, payload } = buildCreateTaxClientPayload(input, user.uid);
+  const path = `clients/${clientId}`;
+
   try {
-    await setDoc(doc(db, 'clients', clientId), payload);
+    await setDoc(doc(db, 'clients', clientId), {
+      ...payload,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
     return clientId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function updateClientProfileDetails(
+  clientId: string,
+  updates: {
+    name: string;
+    email: string;
+    phone: string;
+    taxYear: number;
+    filingCategory: FilingCategory;
+  }
+): Promise<void> {
+  const path = `clients/${clientId}`;
+  try {
+    await updateDoc(doc(db, 'clients', clientId), {
+      name: clampString(updates.name, BLUEPRINT_LIMITS.NAME_MAX),
+      email: clampString(updates.email.toLowerCase(), BLUEPRINT_LIMITS.EMAIL_MAX),
+      phone: clampString(updates.phone, BLUEPRINT_LIMITS.PHONE_MAX),
+      taxYear: Math.min(
+        BLUEPRINT_LIMITS.TAX_YEAR_MAX,
+        Math.max(BLUEPRINT_LIMITS.TAX_YEAR_MIN, Math.round(updates.taxYear))
+      ),
+      filingCategory: updates.filingCategory,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
 

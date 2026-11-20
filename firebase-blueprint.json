@@ -422,6 +422,146 @@
         "updatedByEmail",
         "updatedAt"
       ]
+    },
+    "AppConfigSettings": {
+      "title": "AppConfigSettings",
+      "description": "Firm-wide application configuration (Year of Assessment, reminder intervals, default document templates) managed via System Administrator governance.",
+      "type": "object",
+      "properties": {
+        "activeTaxYear": {
+          "type": "integer"
+        },
+        "reminderIntervalDays": {
+          "type": "integer"
+        },
+        "defaultTemplates": {
+          "type": "object"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "activeTaxYear",
+        "reminderIntervalDays",
+        "defaultTemplates",
+        "updatedByUid",
+        "updatedByEmail",
+        "updatedAt"
+      ]
+    },
+    "GovernanceChangeRequest": {
+      "title": "GovernanceChangeRequest",
+      "description": "Unified Danger Zone change approval request gating client database mutations, app configuration changes, role elevations, and 2FA changes.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": ["CLIENT_DB_CHANGE", "APP_CONFIG_CHANGE", "ROLE_ELEVATION", "TWO_FACTOR_CHANGE"]
+        },
+        "targetCollection": {
+          "type": "string",
+          "enum": ["clients", "system_settings", "users"]
+        },
+        "targetDocId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "targetLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["CREATE", "UPDATE", "DELETE"]
+        },
+        "proposedPayload": {
+          "type": "object"
+        },
+        "previousSummary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 600
+        },
+        "requestedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requestedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "requestedByRole": {
+          "type": "string",
+          "enum": ["administrator", "manager", "user"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "APPROVED", "REJECTED"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reviewedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reviewedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reviewNote": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": [
+        "category",
+        "targetCollection",
+        "targetDocId",
+        "targetLabel",
+        "operation",
+        "proposedPayload",
+        "reason",
+        "requestedByUid",
+        "requestedByEmail",
+        "requestedByRole",
+        "status",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -449,9 +589,13 @@
       "schema": { "$ref": "#/entities/TwoFactorChangeRequest" },
       "description": "Approval workflow requests for modifying locked Two-Factor Authentication settings."
     },
+    "/change_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/GovernanceChangeRequest" },
+      "description": "Unified Danger Zone governance approval queue for client DB changes, app configuration changes, role elevations, and 2FA changes."
+    },
     "/system_settings/{settingId}": {
       "schema": { "$ref": "#/entities/SystemSecuritySettings" },
-      "description": "Global system security settings (e.g., /system_settings/security)."
+      "description": "Global system security and app configuration settings (/system_settings/security and /system_settings/app_config)."
     }
   }
 }

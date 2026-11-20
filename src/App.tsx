@@ -12,6 +12,7 @@ import {
   UserCog,
   ClipboardList,
   ShieldAlert,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { auth, googleProvider, unsubscribeAllFirestoreListeners } from './lib/firebase';
 import {
@@ -21,13 +22,14 @@ import {
   subscribeToUserProfile,
   getAllUserProfiles,
 } from './lib/taxService';
+import { DEFAULT_APP_CONFIG, subscribeToAppConfig } from './lib/governanceService';
 import { logActivity, setAuditUserContext } from './lib/auditService';
 import {
   clearStoredActivity,
   useIdleLogout,
   writeStoredActivity,
 } from './hooks/useIdleLogout';
-import type { TaxClient, UserProfile, UserRole } from './types/tax';
+import type { AppConfigSettings, TaxClient, UserProfile, UserRole } from './types/tax';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SignInScreen } from './components/SignInScreen';
 import { StaffDashboard } from './components/StaffDashboard';
@@ -37,9 +39,16 @@ import { NewClientModal } from './components/NewClientModal';
 import { UserRoleManagementModal } from './components/UserRoleManagementModal';
 import { AuditTrailView } from './components/AuditTrailView';
 import { DangerZoneView } from './components/DangerZoneView';
+import { AppSettingsView } from './components/AppSettingsView';
 import { IdleWarningModal } from './components/IdleWarningModal';
 
-type NavSection = 'clients' | 'reminders' | 'client-portal' | 'audit-trail' | 'danger-zone';
+type NavSection =
+  | 'clients'
+  | 'reminders'
+  | 'client-portal'
+  | 'audit-trail'
+  | 'app-settings'
+  | 'danger-zone';
 
 function CukaiDeskApp() {
   const [user, setUser] = useState<User | null>(null);
@@ -62,10 +71,23 @@ function CukaiDeskApp() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [idleNotice, setIdleNotice] = useState<string | null>(null);
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [appConfig, setAppConfig] = useState<AppConfigSettings>(DEFAULT_APP_CONFIG);
+  const [governanceToast, setGovernanceToast] = useState<string | null>(null);
 
   const userInitiatedSignInRef = useRef(false);
   const lastLoggedPageRef = useRef<string | null>(null);
   const signingOutRef = useRef(false);
+  const toastTimerRef = useRef<number | null>(null);
+
+  const showGovernanceToast = useCallback((message: string) => {
+    setGovernanceToast(message);
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setGovernanceToast(null);
+    }, 6500);
+  }, []);
 
   if (runtimeError) {
     throw runtimeError;
@@ -113,7 +135,7 @@ function CukaiDeskApp() {
 
   useEffect(() => {
     if (!authReady || !user || isSigningOut) return;
-    const unsub = subscribeToUserProfile(
+    const unsubProfile = subscribeToUserProfile(
       user.uid,
       (liveProfile) => {
         if (liveProfile) {
@@ -126,7 +148,17 @@ function CukaiDeskApp() {
         console.error('Live profile sync error:', err);
       }
     );
-    return () => unsub();
+    const unsubConfig = subscribeToAppConfig(
+      (cfg) => setAppConfig(cfg),
+      (err) => {
+        if (signingOutRef.current) return;
+        console.error('Live app config sync error:', err);
+      }
+    );
+    return () => {
+      unsubProfile();
+      unsubConfig();
+    };
   }, [authReady, user, isSigningOut]);
 
   useEffect(() => {
@@ -182,12 +214,16 @@ function CukaiDeskApp() {
   }, [clients, selectedClientId, role, userProfile?.assignedClientId, user?.email]);
 
   const overdueCount = useMemo(
-    () => clients.filter((c) => determineWorkflowStage(c).isEscalated).length,
-    [clients]
+    () =>
+      clients.filter(
+        (c) => determineWorkflowStage(c, appConfig.reminderIntervalDays).isEscalated
+      ).length,
+    [clients, appConfig.reminderIntervalDays]
   );
 
   const currentPageLabel = useMemo(() => {
     if (activeNav === 'danger-zone') return 'Danger Zone';
+    if (activeNav === 'app-settings') return 'App Settings';
     if (activeNav === 'audit-trail' && isAdminOrManager) return 'Audit Trail';
     if (activeNav === 'reminders' && isAdminOrManager) return 'Follow-Up Queue';
     if (!isAdminOrManager || activeNav === 'client-portal') {
@@ -312,6 +348,9 @@ function CukaiDeskApp() {
     if (activeNav === 'danger-zone') {
       return 'Security / Danger Zone';
     }
+    if (activeNav === 'app-settings') {
+      return 'Configuration / App Settings';
+    }
     if (activeNav === 'audit-trail' && isAdminOrManager) {
       return 'Compliance / User Activity & Audit Trail';
     }
@@ -423,7 +462,7 @@ function CukaiDeskApp() {
                 <span>Audit Trail</span>
               </button>
 
-              {role === 'administrator' && (
+              {isAdminOrManager && (
                 <button
                   type="button"
                   onClick={() => setShowRoleModal(true)}
@@ -449,7 +488,20 @@ function CukaiDeskApp() {
             </button>
           )}
 
-          <div className="pt-3 mt-3 border-t border-slate-200">
+          <div className="pt-3 mt-3 border-t border-slate-200 space-y-1">
+            <button
+              type="button"
+              onClick={() => handleNavClick('app-settings')}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+                activeNav === 'app-settings'
+                  ? 'bg-slate-100 text-slate-900'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <SlidersHorizontal className="w-4 h-4 shrink-0" />
+              <span>App Settings</span>
+            </button>
+
             <button
               type="button"
               onClick={() => handleNavClick('danger-zone')}
@@ -536,7 +588,7 @@ function CukaiDeskApp() {
                   >
                     Audit Trail
                   </button>
-                  {role === 'administrator' && (
+                  {isAdminOrManager && (
                     <button
                       type="button"
                       onClick={() => {
@@ -563,7 +615,20 @@ function CukaiDeskApp() {
                 </button>
               )}
 
-              <div className="pt-2 mt-2 border-t border-slate-200">
+              <div className="pt-2 mt-2 border-t border-slate-200 space-y-1">
+                <button
+                  type="button"
+                  onClick={() => handleNavClick('app-settings')}
+                  className={`w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium rounded-lg ${
+                    activeNav === 'app-settings'
+                      ? 'bg-slate-100 text-slate-900'
+                      : 'text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  <SlidersHorizontal className="w-4 h-4 shrink-0" />
+                  <span>App Settings</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => handleNavClick('danger-zone')}
@@ -625,7 +690,7 @@ function CukaiDeskApp() {
               </select>
             )}
 
-            {role === 'administrator' && (
+            {isAdminOrManager && (
               <button
                 type="button"
                 onClick={() => setShowRoleModal(true)}
@@ -636,7 +701,7 @@ function CukaiDeskApp() {
               </button>
             )}
 
-            {role === 'administrator' && (
+            {isAdminOrManager && (
               <button
                 type="button"
                 onClick={() => setShowNewClientModal(true)}
@@ -659,6 +724,11 @@ function CukaiDeskApp() {
                   setSelectedClientId(null);
                 }
               }}
+            />
+          ) : activeNav === 'app-settings' && userProfile ? (
+            <AppSettingsView
+              userProfile={userProfile}
+              onGovernanceSubmitted={showGovernanceToast}
             />
           ) : activeNav === 'audit-trail' && isAdminOrManager ? (
             <AuditTrailView userRole={role} />
@@ -684,6 +754,8 @@ function CukaiDeskApp() {
                 staffProfiles={staffProfiles}
                 portalMode="client"
                 userEmail={user.email || ''}
+                reminderIntervalDays={appConfig.reminderIntervalDays}
+                onGovernanceSubmitted={showGovernanceToast}
                 onTogglePortalPreview={
                   isAdminOrManager
                     ? () => {
@@ -711,11 +783,13 @@ function CukaiDeskApp() {
               staffProfiles={staffProfiles}
               portalMode={portalMode}
               userEmail={user.email || ''}
+              reminderIntervalDays={appConfig.reminderIntervalDays}
               onBack={() => setSelectedClientId(null)}
               onTogglePortalPreview={() => {
                 setPortalMode((m) => (m === 'staff' ? 'client' : 'staff'));
               }}
               onDeleted={() => setSelectedClientId(null)}
+              onGovernanceSubmitted={showGovernanceToast}
             />
           ) : (
             <StaffDashboard
@@ -723,6 +797,7 @@ function CukaiDeskApp() {
               loading={clientsLoading}
               userRole={role}
               staffProfiles={staffProfiles}
+              reminderIntervalDays={appConfig.reminderIntervalDays}
               onSelectClient={(id) => {
                 setSelectedClientId(id);
                 setPortalMode('staff');
@@ -732,6 +807,7 @@ function CukaiDeskApp() {
                 setHighlightedReminderClient(clientId ?? null);
                 setActiveNav('reminders');
               }}
+              onGovernanceSubmitted={showGovernanceToast}
             />
           )}
         </main>
@@ -739,6 +815,8 @@ function CukaiDeskApp() {
 
       {showNewClientModal && (
         <NewClientModal
+          userRole={role}
+          appConfig={appConfig}
           defaultEmail={isAdminOrManager ? '' : user.email || ''}
           defaultName={isAdminOrManager ? '' : user.displayName || ''}
           lockEmailToUser={!isAdminOrManager}
@@ -751,14 +829,48 @@ function CukaiDeskApp() {
               setActiveNav('client-portal');
             }
           }}
+          onGovernanceSubmitted={showGovernanceToast}
         />
       )}
 
-      {showRoleModal && role === 'administrator' && (
+      {showRoleModal && isAdminOrManager && (
         <UserRoleManagementModal
           currentUid={user.uid}
+          currentUserRole={role}
           onClose={() => setShowRoleModal(false)}
+          onGovernanceSubmitted={showGovernanceToast}
         />
+      )}
+
+      {governanceToast && (
+        <div
+          role="status"
+          className="fixed bottom-5 right-5 z-[70] max-w-md bg-slate-900 text-white border border-slate-700 rounded-xl px-4 py-3.5 shadow-xl flex items-start gap-3 text-xs"
+        >
+          <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <div className="space-y-1 flex-1">
+            <p className="font-medium leading-relaxed">{governanceToast}</p>
+            <div className="flex items-center gap-3 pt-0.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setGovernanceToast(null);
+                  handleNavClick('danger-zone');
+                }}
+                className="text-amber-300 hover:text-amber-200 font-semibold underline underline-offset-2 cursor-pointer"
+              >
+                Open Danger Zone
+              </button>
+              <button
+                type="button"
+                onClick={() => setGovernanceToast(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       <IdleWarningModal

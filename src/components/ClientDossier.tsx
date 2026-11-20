@@ -18,6 +18,8 @@ import {
   CheckCircle2,
   FileCheck,
   UserCheck,
+  Pencil,
+  X,
 } from 'lucide-react';
 import {
   ALL_STANDARD_DOC_TYPES,
@@ -26,6 +28,7 @@ import {
   type AnalyzeDocumentResult,
   type DocumentStatus,
   type DocumentVerificationRecord,
+  type FilingCategory,
   type JobStatus,
   type ReminderChannel,
   type ReminderLogRecord,
@@ -46,9 +49,12 @@ import {
   toggleClientLock,
   updateClientChecklistItem,
   updateClientChecklistStructure,
+  updateClientProfileDetails,
 } from '../lib/taxService';
+import { submitGovernanceChangeRequest } from '../lib/governanceService';
 import { logActivity } from '../lib/auditService';
 import { DocumentStatusText, formatMyr, JobStatusText } from './StatusIndicator';
+import { GovernanceReasonModal } from './GovernanceReasonModal';
 
 interface ClientDossierProps {
   client: TaxClient;
@@ -56,9 +62,11 @@ interface ClientDossierProps {
   staffProfiles: UserProfile[];
   portalMode: 'staff' | 'client';
   userEmail: string;
+  reminderIntervalDays?: number;
   onBack?: () => void;
   onTogglePortalPreview?: () => void;
   onDeleted?: () => void;
+  onGovernanceSubmitted: (message: string) => void;
 }
 
 export function ClientDossier({
@@ -67,10 +75,13 @@ export function ClientDossier({
   staffProfiles,
   portalMode,
   userEmail,
+  reminderIntervalDays = 7,
   onBack,
   onTogglePortalPreview,
   onDeleted,
+  onGovernanceSubmitted,
 }: ClientDossierProps) {
+  const isAdmin = userRole === 'administrator';
   const isStaffView = (userRole === 'administrator' || userRole === 'manager') && portalMode === 'staff';
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -91,14 +102,33 @@ export function ClientDossier({
   const [verifications, setVerifications] = useState<DocumentVerificationRecord[]>([]);
   const [reminders, setReminders] = useState<ReminderLogRecord[]>([]);
 
-  // Staff checklist management
+  // Staff checklist & profile management
   const [newDocName, setNewDocName] = useState('');
   const [addingDoc, setAddingDoc] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [assigningStaff, setAssigningStaff] = useState(false);
 
+  // Edit profile modal state
+  const [showEditProfile, setShowEditProfile] = useState(false);
+  const [editName, setEditName] = useState(client.name);
+  const [editEmail, setEditEmail] = useState(client.email);
+  const [editPhone, setEditPhone] = useState(client.phone);
+  const [editTaxYear, setEditTaxYear] = useState(client.taxYear);
+  const [editCategory, setEditCategory] = useState<FilingCategory>(client.filingCategory);
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  // Pending intercepted governance change for non-admin staff
+  const [pendingClientChange, setPendingClientChange] = useState<{
+    title: string;
+    operation: 'UPDATE' | 'DELETE';
+    proposedPayload: Record<string, unknown>;
+    previousSummary: string;
+  } | null>(null);
+  const [submittingGovernance, setSubmittingGovernance] = useState(false);
+  const [governanceError, setGovernanceError] = useState<string | null>(null);
+
   // Reminder composer state (Staff)
-  const workflow = determineWorkflowStage(client);
+  const workflow = determineWorkflowStage(client, reminderIntervalDays);
   const [reminderChannel, setReminderChannel] = useState<ReminderChannel>('Email');
   const [reminderSubject, setReminderSubject] = useState(
     `Action Required: YA ${client.taxYear} Personal Tax Documents (${client.clientId})`
@@ -262,6 +292,28 @@ export function ClientDossier({
       i === idx ? { ...item, ...updates } : item
     );
     const nextStatus = computeJobStatusFromChecklist(nextDocs);
+    const missingList = nextDocs.filter((d) => d.status !== 'Verified').map((d) => d.docType);
+    const nextDraft =
+      nextStatus === 'Book In Can Start'
+        ? `Dear ${client.name}, all required documents for YA ${client.taxYear} (${client.clientId}) are verified. Your file is now marked Book In Can Start.`
+        : nextStatus === 'Pending Document'
+          ? `Dear ${client.name}, thank you for your recent submission for YA ${client.taxYear}. We are still missing: ${missingList.join(', ')}.`
+          : `Dear ${client.name}, your YA ${client.taxYear} personal tax checklist (${client.clientId}) is ready for upload.`;
+
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Checklist & Status Change',
+        operation: 'UPDATE',
+        proposedPayload: {
+          requiredDocuments: nextDocs.slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS),
+          jobStatus: nextStatus,
+          latestReminderDraft: nextDraft,
+        },
+        previousSummary: `"${targetDoc?.docType || 'Document'}": ${targetDoc?.status || 'Missing'} -> ${status} | Job Status: ${previousStatus} -> ${nextStatus}`,
+      });
+      return;
+    }
 
     await updateClientChecklistItem(client, idx, updates);
 
@@ -276,22 +328,38 @@ export function ClientDossier({
     const clean = docType.trim();
     if (!clean) return;
     if (client.requiredDocuments.length >= BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS) return;
-    setAddingDoc(true);
     const previousStatus = client.jobStatus;
-    try {
-      const nextDocs = [
-        ...client.requiredDocuments,
-        {
-          docType: clean,
-          status: 'Missing' as const,
-          fileName: null,
-          fileUrl: null,
-          extractedAmount: null,
-          taxYearValid: null,
-          notes: '',
+    const nextDocs = [
+      ...client.requiredDocuments,
+      {
+        docType: clean,
+        status: 'Missing' as const,
+        fileName: null,
+        fileUrl: null,
+        extractedAmount: null,
+        taxYearValid: null,
+        notes: '',
+      },
+    ];
+    const nextStatus = computeJobStatusFromChecklist(nextDocs);
+
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Add Checklist Requirement',
+        operation: 'UPDATE',
+        proposedPayload: {
+          requiredDocuments: nextDocs.slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS),
+          jobStatus: nextStatus,
         },
-      ];
-      const nextStatus = computeJobStatusFromChecklist(nextDocs);
+        previousSummary: `Add required document "${clean}" (${client.requiredDocuments.length} -> ${nextDocs.length} items) | Job Status: ${previousStatus} -> ${nextStatus}`,
+      });
+      setNewDocName('');
+      return;
+    }
+
+    setAddingDoc(true);
+    try {
       await updateClientChecklistStructure(client, nextDocs);
       setNewDocName('');
       if (nextStatus !== previousStatus) {
@@ -311,6 +379,21 @@ export function ClientDossier({
     const previousStatus = client.jobStatus;
     const next = client.requiredDocuments.filter((_, i) => i !== idx);
     const nextStatus = computeJobStatusFromChecklist(next);
+
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Remove Checklist Requirement',
+        operation: 'UPDATE',
+        proposedPayload: {
+          requiredDocuments: next.slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS),
+          jobStatus: nextStatus,
+        },
+        previousSummary: `Remove required document "${removedDoc}" (${client.requiredDocuments.length} -> ${next.length} items) | Job Status: ${previousStatus} -> ${nextStatus}`,
+      });
+      return;
+    }
+
     await updateClientChecklistStructure(client, next);
     if (nextStatus !== previousStatus) {
       void logActivity({
@@ -322,31 +405,33 @@ export function ClientDossier({
   };
 
   const handleStaffAssignment = async (staffUid: string) => {
-    setAssigningStaff(true);
     const previousAssignee = client.assignedTo?.email || 'Unassigned';
+    const found = staffUid ? staffProfiles.find((p) => p.uid === staffUid) : null;
+    const nextStaff = found
+      ? { uid: found.uid, name: found.displayName, email: found.email }
+      : null;
+
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Duty Assignment',
+        operation: 'UPDATE',
+        proposedPayload: { assignedTo: nextStaff },
+        previousSummary: `Assigned Staff: ${previousAssignee} -> ${nextStaff ? `${nextStaff.name} (${nextStaff.email})` : 'Unassigned'}`,
+      });
+      return;
+    }
+
+    setAssigningStaff(true);
     try {
-      if (!staffUid) {
-        await assignClientToStaff(client.clientId, null);
-        void logActivity({
-          pageVisited: pageLabel,
-          actionTaken: 'ASSIGN_DUTY',
-          details: `Unassigned client ${client.clientId} (${client.name}) — previously assigned to ${previousAssignee}.`,
-        });
-      } else {
-        const found = staffProfiles.find((p) => p.uid === staffUid);
-        if (found) {
-          await assignClientToStaff(client.clientId, {
-            uid: found.uid,
-            name: found.displayName,
-            email: found.email,
-          });
-          void logActivity({
-            pageVisited: pageLabel,
-            actionTaken: 'ASSIGN_DUTY',
-            details: `Assigned client ${client.clientId} (${client.name}) to ${found.displayName} (${found.email}, ${found.role}) — previously ${previousAssignee}.`,
-          });
-        }
-      }
+      await assignClientToStaff(client.clientId, nextStaff);
+      void logActivity({
+        pageVisited: pageLabel,
+        actionTaken: 'ASSIGN_DUTY',
+        details: nextStaff
+          ? `Assigned client ${client.clientId} (${client.name}) to ${nextStaff.name} (${nextStaff.email}) — previously ${previousAssignee}.`
+          : `Unassigned client ${client.clientId} (${client.name}) — previously assigned to ${previousAssignee}.`,
+      });
     } catch (err) {
       console.error('Failed to assign staff:', err);
     } finally {
@@ -356,12 +441,78 @@ export function ClientDossier({
 
   const handleToggleLock = async () => {
     const nextLocked = !client.isLocked;
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: File Lock Status',
+        operation: 'UPDATE',
+        proposedPayload: { isLocked: nextLocked },
+        previousSummary: `File Lock: ${client.isLocked ? 'Locked' : 'Unlocked'} -> ${nextLocked ? 'Locked' : 'Unlocked'}`,
+      });
+      return;
+    }
+
     await toggleClientLock(client, nextLocked);
     void logActivity({
       pageVisited: pageLabel,
       actionTaken: 'TOGGLE_FILE_LOCK',
       details: `${nextLocked ? 'Locked' : 'Unlocked'} tax file ${client.clientId} (${client.name}) for LHDN computation.`,
     });
+  };
+
+  const handleOpenEditProfile = () => {
+    setEditName(client.name);
+    setEditEmail(client.email);
+    setEditPhone(client.phone);
+    setEditTaxYear(client.taxYear);
+    setEditCategory(client.filingCategory);
+    setShowEditProfile(true);
+  };
+
+  const handleSubmitEditProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const updates = {
+      name: editName.trim(),
+      email: editEmail.trim().toLowerCase(),
+      phone: editPhone.trim(),
+      taxYear: editTaxYear,
+      filingCategory: editCategory,
+    };
+    if (!updates.name || !updates.email) return;
+
+    const diffs: string[] = [];
+    if (updates.name !== client.name) diffs.push(`Name: "${client.name}" -> "${updates.name}"`);
+    if (updates.email !== client.email) diffs.push(`Email: "${client.email}" -> "${updates.email}"`);
+    if (updates.phone !== client.phone) diffs.push(`Phone: "${client.phone}" -> "${updates.phone}"`);
+    if (updates.taxYear !== client.taxYear) diffs.push(`YA: ${client.taxYear} -> ${updates.taxYear}`);
+    if (updates.filingCategory !== client.filingCategory) {
+      diffs.push(`Category: ${client.filingCategory} -> ${updates.filingCategory}`);
+    }
+
+    if (!isAdmin) {
+      setShowEditProfile(false);
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Edit Client Profile',
+        operation: 'UPDATE',
+        proposedPayload: updates,
+        previousSummary: diffs.length > 0 ? diffs.join(' | ') : 'Update client profile metadata',
+      });
+      return;
+    }
+
+    setSavingProfile(true);
+    try {
+      await updateClientProfileDetails(client.clientId, updates);
+      void logActivity({
+        pageVisited: pageLabel,
+        actionTaken: 'UPDATE_CLIENT_PROFILE',
+        details: `Updated profile for ${client.clientId}: ${diffs.join(' | ') || 'No field changes'}.`,
+      });
+      setShowEditProfile(false);
+    } finally {
+      setSavingProfile(false);
+    }
   };
 
   const handleGenerateAiReminder = async () => {
@@ -411,7 +562,16 @@ export function ClientDossier({
   };
 
   const handleDelete = async () => {
-    if (userRole !== 'administrator') return;
+    if (!isAdmin) {
+      setGovernanceError(null);
+      setPendingClientChange({
+        title: 'Administrator Approval Required: Delete Client Record',
+        operation: 'DELETE',
+        proposedPayload: { clientId: client.clientId },
+        previousSummary: `Permanently delete client dossier ${client.clientId} (${client.name}, ${client.email}) and nested history.`,
+      });
+      return;
+    }
     await deleteTaxClient(client.clientId);
     void logActivity({
       pageVisited: pageLabel,
@@ -419,6 +579,36 @@ export function ClientDossier({
       details: `Deleted client tax file ${client.clientId} (${client.name}, ${client.email}).`,
     });
     onDeleted?.();
+  };
+
+  const handleConfirmPendingClientChange = async (reason: string) => {
+    if (!pendingClientChange) return;
+    setSubmittingGovernance(true);
+    setGovernanceError(null);
+    try {
+      await submitGovernanceChangeRequest({
+        category: 'CLIENT_DB_CHANGE',
+        targetCollection: 'clients',
+        targetDocId: client.clientId,
+        targetLabel: `${client.clientId} — ${client.name}`,
+        operation: pendingClientChange.operation,
+        proposedPayload: pendingClientChange.proposedPayload,
+        previousSummary: pendingClientChange.previousSummary,
+        reason,
+        requestedByRole: userRole,
+        pageVisited: pageLabel,
+      });
+      setPendingClientChange(null);
+      onGovernanceSubmitted(
+        'Submitted to Danger Zone — awaiting System Administrator approval.'
+      );
+    } catch (err) {
+      setGovernanceError(
+        err instanceof Error ? err.message : 'Failed to submit change request.'
+      );
+    } finally {
+      setSubmittingGovernance(false);
+    }
   };
 
   const verifiedCount = client.requiredDocuments.filter((d) => d.status === 'Verified').length;
@@ -541,6 +731,15 @@ export function ClientDossier({
               <>
                 <button
                   type="button"
+                  onClick={handleOpenEditProfile}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Edit Profile</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={handleToggleLock}
                   className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
@@ -557,7 +756,7 @@ export function ClientDossier({
                   )}
                 </button>
 
-                {userRole === 'administrator' && (
+                {isAdmin ? (
                   <>
                     {!confirmDelete ? (
                       <button
@@ -588,6 +787,15 @@ export function ClientDossier({
                       </div>
                     )}
                   </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleDelete}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-red-700 bg-white border border-slate-200 rounded-lg hover:bg-red-50 hover:border-red-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Request Delete</span>
+                  </button>
                 )}
               </>
             )}
@@ -1205,6 +1413,145 @@ export function ClientDossier({
           </section>
         </div>
       </div>
+
+      {/* Edit Client Profile Modal */}
+      {showEditProfile && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-[1px] flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-profile-modal-title"
+        >
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-lg overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 id="edit-profile-modal-title" className="text-sm font-semibold text-slate-900">
+                Edit Client Profile ({client.clientId})
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowEditProfile(false)}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+                aria-label="Close edit profile modal"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={handleSubmitEditProfile} className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Taxpayer Full Name
+                </label>
+                <input
+                  type="text"
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  maxLength={BLUEPRINT_LIMITS.NAME_MAX}
+                  required
+                  className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    value={editEmail}
+                    onChange={(e) => setEditEmail(e.target.value)}
+                    maxLength={BLUEPRINT_LIMITS.EMAIL_MAX}
+                    required
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Phone / WhatsApp
+                  </label>
+                  <input
+                    type="tel"
+                    value={editPhone}
+                    onChange={(e) => setEditPhone(e.target.value)}
+                    maxLength={BLUEPRINT_LIMITS.PHONE_MAX}
+                    className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Year of Assessment (YA)
+                  </label>
+                  <select
+                    value={editTaxYear}
+                    onChange={(e) => setEditTaxYear(Number(e.target.value))}
+                    className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                  >
+                    {[2027, 2026, 2025, 2024, 2023].map((yr) => (
+                      <option key={yr} value={yr}>
+                        YA {yr}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Filing Category
+                  </label>
+                  <select
+                    value={editCategory}
+                    onChange={(e) => setEditCategory(e.target.value as FilingCategory)}
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                  >
+                    <option value="Form BE (Salaried)">Form BE (Salaried)</option>
+                    <option value="Form B (Business / Commission)">
+                      Form B (Business / Commission)
+                    </option>
+                    <option value="Form M (Non-Resident)">Form M (Non-Resident)</option>
+                  </select>
+                </div>
+              </div>
+              <div className="pt-2 border-t border-slate-200 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowEditProfile(false)}
+                  className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingProfile}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 cursor-pointer"
+                >
+                  {savingProfile
+                    ? 'Saving...'
+                    : isAdmin
+                      ? 'Save Profile'
+                      : 'Request Profile Update'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {pendingClientChange && (
+        <GovernanceReasonModal
+          title={pendingClientChange.title}
+          description="Client database modifications by non-administrator accounts require System Administrator approval. Provide a justification to stage this CLIENT_DB_CHANGE request in the Danger Zone."
+          targetLabel={`${client.clientId} — ${client.name}`}
+          previousSummary={pendingClientChange.previousSummary}
+          confirmLabel="Submit to Danger Zone"
+          submitting={submittingGovernance}
+          error={governanceError}
+          onCancel={() => {
+            setPendingClientChange(null);
+            setGovernanceError(null);
+          }}
+          onConfirm={handleConfirmPendingClientChange}
+        />
+      )}
     </div>
   );
 }

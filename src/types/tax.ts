@@ -46,6 +46,46 @@ export interface SystemSecuritySettings {
   updatedAt?: Timestamp | null;
 }
 
+export interface AppConfigSettings {
+  activeTaxYear: number;
+  reminderIntervalDays: number;
+  defaultTemplates: Record<FilingCategory, string[]>;
+  updatedByUid?: string | null;
+  updatedByEmail?: string | null;
+  updatedAt?: Timestamp | null;
+}
+
+export type GovernanceChangeCategory =
+  | 'CLIENT_DB_CHANGE'
+  | 'APP_CONFIG_CHANGE'
+  | 'ROLE_ELEVATION'
+  | 'TWO_FACTOR_CHANGE';
+
+export type GovernanceTargetCollection = 'clients' | 'system_settings' | 'users';
+export type GovernanceOperation = 'CREATE' | 'UPDATE' | 'DELETE';
+export type GovernanceRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface GovernanceChangeRequest {
+  id?: string;
+  category: GovernanceChangeCategory;
+  targetCollection: GovernanceTargetCollection;
+  targetDocId: string;
+  targetLabel: string;
+  operation: GovernanceOperation;
+  proposedPayload: Record<string, unknown>;
+  previousSummary?: string | null;
+  reason: string;
+  requestedByUid: string;
+  requestedByEmail: string;
+  requestedByRole: UserRole;
+  status: GovernanceRequestStatus;
+  createdAt: Timestamp | null;
+  reviewedByUid?: string | null;
+  reviewedByEmail?: string | null;
+  reviewedAt?: Timestamp | null;
+  reviewNote?: string | null;
+}
+
 export interface TwoFactorSetupResponse {
   qrCodeDataUrl: string;
   issuer: string;

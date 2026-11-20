@@ -12,8 +12,11 @@ import {
   Clock,
   ShieldCheck,
   Loader2,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import type {
+  GovernanceChangeRequest,
   SystemSecuritySettings,
   TaxClient,
   TwoFactorChangeRequest,
@@ -33,6 +36,12 @@ import {
   updateMandatoryTwoFactorPolicy,
   verifyTwoFactorApi,
 } from '../lib/taxService';
+import {
+  approveAndApplyGovernanceRequest,
+  rejectGovernanceRequest,
+  subscribeToAllGovernanceRequests,
+  subscribeToMyGovernanceRequests,
+} from '../lib/governanceService';
 import { formatMytTimestamp, logActivity } from '../lib/auditService';
 
 interface DangerZoneViewProps {
@@ -41,13 +50,20 @@ interface DangerZoneViewProps {
   onClientPurged?: (clientId: string) => void;
 }
 
+type ApprovalTab =
+  | 'ALL_PENDING'
+  | 'CLIENT_DB_CHANGE'
+  | 'APP_CONFIG_CHANGE'
+  | 'ROLE_ELEVATION'
+  | 'TWO_FACTOR_CHANGE';
+
 const REQUEST_TYPE_LABELS: Record<TwoFactorRequestType, string> = {
   DISABLE_2FA: 'Disable Two-Factor Authentication',
   RESET_2FA_SECRET: 'Reset / Bind Authenticator Secret (TOTP)',
   CHANGE_2FA_METHOD: 'Change 2FA Authenticator Method',
 };
 
-const REQUEST_STATUS_STYLES: Record<
+const TWO_FA_STATUS_STYLES: Record<
   TwoFactorChangeRequest['status'],
   { label: string; className: string }
 > = {
@@ -57,6 +73,22 @@ const REQUEST_STATUS_STYLES: Record<
   COMPLETED: { label: 'Completed · Re-Locked', className: 'text-slate-600' },
 };
 
+const GOV_CATEGORY_LABELS: Record<GovernanceChangeRequest['category'], string> = {
+  CLIENT_DB_CHANGE: 'Client DB Change',
+  APP_CONFIG_CHANGE: 'App Config Change',
+  ROLE_ELEVATION: 'Admin/Manager Role Request',
+  TWO_FACTOR_CHANGE: '2FA Request',
+};
+
+const GOV_STATUS_STYLES: Record<
+  GovernanceChangeRequest['status'],
+  { label: string; className: string }
+> = {
+  PENDING: { label: 'PENDING', className: 'text-amber-700' },
+  APPROVED: { label: 'APPROVED', className: 'text-teal-800' },
+  REJECTED: { label: 'REJECTED', className: 'text-red-700' },
+};
+
 export function DangerZoneView({
   userProfile,
   clients,
@@ -64,9 +96,17 @@ export function DangerZoneView({
 }: DangerZoneViewProps) {
   const isAdmin = userProfile.role === 'administrator';
 
+  // Unified Governance Approval Center state
+  const [activeTab, setActiveTab] = useState<ApprovalTab>('ALL_PENDING');
+  const [governanceRequests, setGovernanceRequests] = useState<GovernanceChangeRequest[]>([]);
+  const [governanceLoading, setGovernanceLoading] = useState(true);
+  const [reviewNotes, setReviewNotes] = useState<Record<string, string>>({});
+  const [expandedPayloads, setExpandedPayloads] = useState<Record<string, boolean>>({});
+  const [processingGovId, setProcessingGovId] = useState<string | null>(null);
+
   // Section A: User's own 2FA requests & setup workflow
-  const [myRequests, setMyRequests] = useState<TwoFactorChangeRequest[]>([]);
-  const [myRequestsLoading, setMyRequestsLoading] = useState(true);
+  const [my2faRequests, setMy2faRequests] = useState<TwoFactorChangeRequest[]>([]);
+  const [my2faLoading, setMy2faLoading] = useState(true);
   const [requestType, setRequestType] = useState<TwoFactorRequestType>('RESET_2FA_SECRET');
   const [reason, setReason] = useState('');
   const [submittingRequest, setSubmittingRequest] = useState(false);
@@ -77,10 +117,10 @@ export function DangerZoneView({
   const [totpCode, setTotpCode] = useState('');
   const [completing2fa, setCompleting2fa] = useState(false);
 
-  // Section B: System Admin Approval Queue
-  const [allRequests, setAllRequests] = useState<TwoFactorChangeRequest[]>([]);
-  const [adminQueueLoading, setAdminQueueLoading] = useState(isAdmin);
-  const [reviewingId, setReviewingId] = useState<string | null>(null);
+  // Admin 2FA requests (included in Unified Approval Center)
+  const [all2faRequests, setAll2faRequests] = useState<TwoFactorChangeRequest[]>([]);
+  const [admin2faLoading, setAdmin2faLoading] = useState(isAdmin);
+  const [reviewing2faId, setReviewing2faId] = useState<string | null>(null);
 
   // Section C: Global Mandatory 2FA Policy + Permanent Client Record Purge
   const [securitySettings, setSecuritySettings] = useState<SystemSecuritySettings>({
@@ -100,17 +140,51 @@ export function DangerZoneView({
     message: string;
   } | null>(null);
 
+  // Subscribe to Unified Governance Requests (`change_requests`)
+  useEffect(() => {
+    setGovernanceLoading(true);
+    const unsub = isAdmin
+      ? subscribeToAllGovernanceRequests(
+          (rows) => {
+            setGovernanceRequests(rows);
+            setGovernanceLoading(false);
+          },
+          (err) => {
+            setGovernanceLoading(false);
+            setFeedback({
+              tone: 'error',
+              message: err.message || 'Unable to load governance change requests.',
+            });
+          }
+        )
+      : subscribeToMyGovernanceRequests(
+          userProfile.uid,
+          (rows) => {
+            setGovernanceRequests(rows);
+            setGovernanceLoading(false);
+          },
+          (err) => {
+            setGovernanceLoading(false);
+            setFeedback({
+              tone: 'error',
+              message: err.message || 'Unable to load your submitted change requests.',
+            });
+          }
+        );
+    return () => unsub();
+  }, [isAdmin, userProfile.uid]);
+
   // Subscribe to current user's 2FA requests
   useEffect(() => {
-    setMyRequestsLoading(true);
+    setMy2faLoading(true);
     const unsub = subscribeToMyTwoFactorRequests(
       userProfile.uid,
       (rows) => {
-        setMyRequests(rows);
-        setMyRequestsLoading(false);
+        setMy2faRequests(rows);
+        setMy2faLoading(false);
       },
       (err) => {
-        setMyRequestsLoading(false);
+        setMy2faLoading(false);
         setFeedback({
           tone: 'error',
           message: err.message || 'Unable to load your 2FA change requests.',
@@ -132,18 +206,18 @@ export function DangerZoneView({
   // Subscribe to all 2FA requests when administrator
   useEffect(() => {
     if (!isAdmin) {
-      setAdminQueueLoading(false);
-      setAllRequests([]);
+      setAdmin2faLoading(false);
+      setAll2faRequests([]);
       return;
     }
-    setAdminQueueLoading(true);
+    setAdmin2faLoading(true);
     const unsub = subscribeToAllTwoFactorRequests(
       (rows) => {
-        setAllRequests(rows);
-        setAdminQueueLoading(false);
+        setAll2faRequests(rows);
+        setAdmin2faLoading(false);
       },
       (err) => {
-        setAdminQueueLoading(false);
+        setAdmin2faLoading(false);
         setFeedback({
           tone: 'error',
           message: err.message || 'Unable to load the 2FA approval queue.',
@@ -153,28 +227,71 @@ export function DangerZoneView({
     return () => unsub();
   }, [isAdmin]);
 
-  const activeApprovedRequest = useMemo(
-    () => myRequests.find((r) => r.status === 'APPROVED') ?? null,
-    [myRequests]
+  // Tab counts & filtered collections
+  const visible2faSource = isAdmin ? all2faRequests : my2faRequests;
+
+  const pendingCounts = useMemo(() => {
+    const clientDb = governanceRequests.filter(
+      (r) => r.status === 'PENDING' && r.category === 'CLIENT_DB_CHANGE'
+    ).length;
+    const appConfig = governanceRequests.filter(
+      (r) => r.status === 'PENDING' && r.category === 'APP_CONFIG_CHANGE'
+    ).length;
+    const roleElev = governanceRequests.filter(
+      (r) => r.status === 'PENDING' && r.category === 'ROLE_ELEVATION'
+    ).length;
+    const twoFaGov = governanceRequests.filter(
+      (r) => r.status === 'PENDING' && r.category === 'TWO_FACTOR_CHANGE'
+    ).length;
+    const twoFaDirect = visible2faSource.filter((r) => r.status === 'PENDING').length;
+    const twoFa = twoFaGov + twoFaDirect;
+    return {
+      ALL_PENDING: clientDb + appConfig + roleElev + twoFa,
+      CLIENT_DB_CHANGE: clientDb,
+      APP_CONFIG_CHANGE: appConfig,
+      ROLE_ELEVATION: roleElev,
+      TWO_FACTOR_CHANGE: twoFa,
+    };
+  }, [governanceRequests, visible2faSource]);
+
+  const filteredGovernancePending = useMemo(() => {
+    return governanceRequests.filter((r) => {
+      if (r.status !== 'PENDING') return false;
+      if (activeTab === 'ALL_PENDING') return true;
+      return r.category === activeTab;
+    });
+  }, [governanceRequests, activeTab]);
+
+  const filteredGovernanceHistory = useMemo(() => {
+    return governanceRequests.filter((r) => {
+      if (isAdmin && r.status === 'PENDING') return false;
+      if (activeTab === 'ALL_PENDING') return true;
+      return r.category === activeTab;
+    });
+  }, [governanceRequests, activeTab, isAdmin]);
+
+  const filtered2faPending = useMemo(() => {
+    if (activeTab !== 'ALL_PENDING' && activeTab !== 'TWO_FACTOR_CHANGE') return [];
+    return visible2faSource.filter((r) => r.status === 'PENDING');
+  }, [visible2faSource, activeTab]);
+
+  const filtered2faHistory = useMemo(() => {
+    if (activeTab !== 'ALL_PENDING' && activeTab !== 'TWO_FACTOR_CHANGE') return [];
+    return visible2faSource.filter((r) => (isAdmin ? r.status !== 'PENDING' : true));
+  }, [visible2faSource, activeTab, isAdmin]);
+
+  const activeApproved2faRequest = useMemo(
+    () => my2faRequests.find((r) => r.status === 'APPROVED') ?? null,
+    [my2faRequests]
   );
 
-  const hasPendingRequest = useMemo(
-    () => myRequests.some((r) => r.status === 'PENDING'),
-    [myRequests]
+  const hasPending2faRequest = useMemo(
+    () => my2faRequests.some((r) => r.status === 'PENDING'),
+    [my2faRequests]
   );
 
   const is2faUnlockedForChange =
-    userProfile.twoFactorLocked === false && Boolean(activeApprovedRequest);
-
-  const pendingAdminRequests = useMemo(
-    () => allRequests.filter((r) => r.status === 'PENDING'),
-    [allRequests]
-  );
-
-  const reviewedAdminRequests = useMemo(
-    () => allRequests.filter((r) => r.status !== 'PENDING'),
-    [allRequests]
-  );
+    userProfile.twoFactorLocked === false && Boolean(activeApproved2faRequest);
 
   const selectedPurgeClient = useMemo(
     () => clients.find((c) => c.clientId === selectedPurgeClientId) ?? null,
@@ -202,6 +319,60 @@ export function DangerZoneView({
     }
     return 'Not Configured';
   })();
+
+  const handleApproveGovernance = async (req: GovernanceChangeRequest) => {
+    if (!isAdmin || !req.id) return;
+    setFeedback(null);
+    setProcessingGovId(req.id);
+    try {
+      await approveAndApplyGovernanceRequest(req, reviewNotes[req.id]);
+      setReviewNotes((prev) => {
+        const next = { ...prev };
+        delete next[req.id!];
+        return next;
+      });
+      setFeedback({
+        tone: 'success',
+        message: `Approved & applied ${GOV_CATEGORY_LABELS[req.category]} (${req.operation}) for ${req.targetLabel}.`,
+      });
+    } catch (err) {
+      setFeedback({
+        tone: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Failed to approve and apply governance request.',
+      });
+    } finally {
+      setProcessingGovId(null);
+    }
+  };
+
+  const handleRejectGovernance = async (req: GovernanceChangeRequest) => {
+    if (!isAdmin || !req.id) return;
+    setFeedback(null);
+    setProcessingGovId(req.id);
+    try {
+      await rejectGovernanceRequest(req, reviewNotes[req.id]);
+      setReviewNotes((prev) => {
+        const next = { ...prev };
+        delete next[req.id!];
+        return next;
+      });
+      setFeedback({
+        tone: 'success',
+        message: `Rejected ${GOV_CATEGORY_LABELS[req.category]} request for ${req.targetLabel}.`,
+      });
+    } catch (err) {
+      setFeedback({
+        tone: 'error',
+        message:
+          err instanceof Error ? err.message : 'Failed to reject governance request.',
+      });
+    } finally {
+      setProcessingGovId(null);
+    }
+  };
 
   const handleSubmit2faRequest = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -268,7 +439,7 @@ export function DangerZoneView({
 
   const handleVerifyAndCompleteTotp = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeApprovedRequest || !is2faUnlockedForChange) return;
+    if (!activeApproved2faRequest || !is2faUnlockedForChange) return;
     setFeedback(null);
     setCompleting2fa(true);
 
@@ -276,14 +447,14 @@ export function DangerZoneView({
       await verifyTwoFactorApi(userProfile.uid, totpCode.trim(), 'bind');
       await completeTwoFactorUpdate({
         uid: userProfile.uid,
-        requestId: activeApprovedRequest.id,
+        requestId: activeApproved2faRequest.id,
         twoFactorEnabled: true,
       });
 
       await logActivity({
         pageVisited: 'Danger Zone',
         actionTaken: 'COMPLETE_2FA_CHANGE',
-        details: `Completed approved ${activeApprovedRequest.requestType} request (${activeApprovedRequest.id}); authenticator TOTP verified and 2FA immediately re-locked.`,
+        details: `Completed approved ${activeApproved2faRequest.requestType} request (${activeApproved2faRequest.id}); authenticator TOTP verified and 2FA immediately re-locked.`,
       });
 
       setQrSetup(null);
@@ -305,7 +476,7 @@ export function DangerZoneView({
   };
 
   const handleCompleteDisable2fa = async () => {
-    if (!activeApprovedRequest || !is2faUnlockedForChange) return;
+    if (!activeApproved2faRequest || !is2faUnlockedForChange) return;
     setFeedback(null);
     setCompleting2fa(true);
 
@@ -313,14 +484,14 @@ export function DangerZoneView({
       await verifyTwoFactorApi(userProfile.uid, '', 'clear');
       await completeTwoFactorUpdate({
         uid: userProfile.uid,
-        requestId: activeApprovedRequest.id,
+        requestId: activeApproved2faRequest.id,
         twoFactorEnabled: false,
       });
 
       await logActivity({
         pageVisited: 'Danger Zone',
         actionTaken: 'COMPLETE_2FA_CHANGE',
-        details: `Completed approved DISABLE_2FA request (${activeApprovedRequest.id}); TOTP secret cleared and 2FA settings immediately re-locked.`,
+        details: `Completed approved DISABLE_2FA request (${activeApproved2faRequest.id}); TOTP secret cleared and 2FA settings immediately re-locked.`,
       });
 
       setQrSetup(null);
@@ -341,13 +512,13 @@ export function DangerZoneView({
     }
   };
 
-  const handleAdminReview = async (
+  const handleAdmin2faReview = async (
     req: TwoFactorChangeRequest,
     decision: 'APPROVED' | 'REJECTED'
   ) => {
     if (!isAdmin) return;
     setFeedback(null);
-    setReviewingId(req.id);
+    setReviewing2faId(req.id);
     try {
       await reviewTwoFactorChangeRequest(req, decision);
       await logActivity({
@@ -365,7 +536,7 @@ export function DangerZoneView({
         tone: 'success',
         message:
           decision === 'APPROVED'
-            ? `Approved ${req.requesterEmail}'s request and unlocked their 2FA controls for a single change.`
+            ? `Approved ${req.requesterEmail}'s 2FA request and unlocked their 2FA controls for a single change.`
             : `Rejected ${req.requesterEmail}'s 2FA change request.`,
       });
     } catch (err) {
@@ -375,7 +546,7 @@ export function DangerZoneView({
           err instanceof Error ? err.message : 'Failed to process 2FA review decision.',
       });
     } finally {
-      setReviewingId(null);
+      setReviewing2faId(null);
     }
   };
 
@@ -443,6 +614,22 @@ export function DangerZoneView({
     }
   };
 
+  const APPROVAL_TABS: Array<{ id: ApprovalTab; label: string; count: number }> = [
+    { id: 'ALL_PENDING', label: 'All Pending', count: pendingCounts.ALL_PENDING },
+    { id: 'CLIENT_DB_CHANGE', label: 'Client DB Changes', count: pendingCounts.CLIENT_DB_CHANGE },
+    { id: 'APP_CONFIG_CHANGE', label: 'App Changes', count: pendingCounts.APP_CONFIG_CHANGE },
+    {
+      id: 'ROLE_ELEVATION',
+      label: 'Admin/Manager Role Requests',
+      count: pendingCounts.ROLE_ELEVATION,
+    },
+    { id: 'TWO_FACTOR_CHANGE', label: '2FA Requests', count: pendingCounts.TWO_FACTOR_CHANGE },
+  ];
+
+  const isQueueLoading = governanceLoading || (isAdmin ? admin2faLoading : my2faLoading);
+  const totalPendingInActiveTab =
+    filteredGovernancePending.length + filtered2faPending.length;
+
   return (
     <div className="space-y-6">
       {/* Danger Zone Header Banner */}
@@ -454,12 +641,12 @@ export function DangerZoneView({
             </div>
             <div>
               <h1 className="text-lg font-bold text-slate-900 tracking-tight">
-                Danger Zone &amp; 2FA Governance
+                Danger Zone — Unified Governance &amp; Approval Center
               </h1>
               <p className="text-sm text-slate-600 mt-1 max-w-2xl leading-relaxed">
-                High-privilege security controls protected by dual-control System Administrator
-                approval and immutable audit logging. All changes executed here are permanently
-                recorded in the compliance audit trail.
+                System Administrator approval gates for all client database mutations, app
+                configuration changes, elevated role assignments, and locked 2FA controls. Every
+                decision is atomically applied and recorded in the immutable audit trail.
               </p>
             </div>
           </div>
@@ -502,6 +689,467 @@ export function DangerZoneView({
       )}
 
       {/* =================================================================== */}
+      {/* UNIFIED APPROVAL CENTER (Visible to all roles; Admin approves)      */}
+      {/* =================================================================== */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-teal-700" />
+                <span>
+                  {isAdmin
+                    ? 'System Administrator Approval Queue'
+                    : 'Your Submitted Governance & Change Requests'}
+                </span>
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {isAdmin
+                  ? 'Review pending requests from change_requests and two_factor_requests. Clicking "Approve & Apply" executes the staged Firestore write atomically.'
+                  : 'Track real-time System Administrator review status (PENDING, APPROVED, REJECTED) for all changes you have proposed.'}
+              </p>
+            </div>
+            <span className="font-mono text-xs font-semibold text-slate-700 tabular-nums whitespace-nowrap">
+              {pendingCounts.ALL_PENDING} pending total
+            </span>
+          </div>
+
+          {/* Filter Tabs */}
+          <div
+            className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg"
+            role="tablist"
+            aria-label="Filter governance requests"
+          >
+            {APPROVAL_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === tab.id
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <span>{tab.label}</span>
+                <span
+                  className={`font-mono text-[11px] tabular-nums ${
+                    tab.count > 0 ? 'font-semibold text-red-700' : 'text-slate-400'
+                  }`}
+                >
+                  {tab.count}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="p-6 space-y-6">
+          {isQueueLoading ? (
+            <div className="text-xs text-slate-500 py-6">Loading governance requests...</div>
+          ) : isAdmin ? (
+            /* ---------------- ADMINISTRATOR APPROVAL QUEUE ---------------- */
+            <>
+              {totalPendingInActiveTab === 0 ? (
+                <div className="border border-dashed border-slate-200 rounded-lg px-6 py-10 text-center">
+                  <CheckCircle2 className="w-6 h-6 text-slate-400 mx-auto mb-2" />
+                  <p className="text-sm font-semibold text-slate-900">
+                    No pending requests in this category
+                  </p>
+                  <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                    Real-time client DB mutations, app config proposals, role elevation requests,
+                    and 2FA unlock requests awaiting System Administrator review will appear here.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {/* Pending Unified Governance Requests (change_requests) */}
+                  {filteredGovernancePending.map((req) => {
+                    const id = req.id || '';
+                    const isProcessing = processingGovId === id;
+                    const isExpanded = Boolean(expandedPayloads[id]);
+                    return (
+                      <div
+                        key={id}
+                        className="border border-slate-200 rounded-xl p-5 bg-slate-50/40 space-y-3.5"
+                      >
+                        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              <span className="font-semibold text-red-700">
+                                {GOV_CATEGORY_LABELS[req.category]}
+                              </span>
+                              <span className="text-slate-300" aria-hidden="true">·</span>
+                              <span className="font-mono font-semibold text-slate-800">
+                                {req.operation}
+                              </span>
+                              <span className="text-slate-300" aria-hidden="true">·</span>
+                              <span className="font-mono text-slate-600">
+                                {req.targetCollection}/{req.targetDocId}
+                              </span>
+                            </div>
+                            <h3 className="text-sm font-semibold text-slate-900">
+                              {req.targetLabel}
+                            </h3>
+                            <p className="text-xs text-slate-500">
+                              Requested by{' '}
+                              <span className="font-medium text-slate-800">
+                                {req.requestedByEmail}
+                              </span>{' '}
+                              (<span className="capitalize">{req.requestedByRole}</span>) on{' '}
+                              <span className="font-mono tabular-nums">
+                                {formatMytTimestamp(req.createdAt)}
+                              </span>
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() => handleApproveGovernance(req)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors cursor-pointer"
+                            >
+                              {isProcessing ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                              )}
+                              <span>Approve &amp; Apply</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() => handleRejectGovernance(req)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-50 transition-colors cursor-pointer"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              <span>Reject</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {req.previousSummary && (
+                          <div className="p-3 bg-white border border-slate-200 rounded-lg text-xs text-slate-700">
+                            <span className="font-semibold text-slate-900">Proposed Change: </span>
+                            <span>{req.previousSummary}</span>
+                          </div>
+                        )}
+
+                        <div className="text-xs text-slate-700">
+                          <span className="font-semibold text-slate-900">Justification: </span>
+                          <span>{req.reason}</span>
+                        </div>
+
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedPayloads((prev) => ({ ...prev, [id]: !prev[id] }))
+                            }
+                            className="inline-flex items-center gap-1 text-xs font-medium text-teal-800 hover:text-teal-950 cursor-pointer"
+                          >
+                            {isExpanded ? (
+                              <ChevronUp className="w-3.5 h-3.5" />
+                            ) : (
+                              <ChevronDown className="w-3.5 h-3.5" />
+                            )}
+                            <span>
+                              {isExpanded ? 'Hide Proposed Payload' : 'Inspect Proposed Payload'}
+                            </span>
+                          </button>
+
+                          <input
+                            type="text"
+                            maxLength={500}
+                            value={reviewNotes[id] || ''}
+                            onChange={(e) =>
+                              setReviewNotes((prev) => ({ ...prev, [id]: e.target.value }))
+                            }
+                            placeholder="Optional admin review note..."
+                            className="sm:w-72 px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
+                          />
+                        </div>
+
+                        {isExpanded && (
+                          <pre className="p-3 bg-slate-900 text-slate-100 rounded-lg text-[11px] font-mono overflow-x-auto max-h-56">
+                            {JSON.stringify(req.proposedPayload, null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {/* Pending 2FA Requests (two_factor_requests) */}
+                  {filtered2faPending.map((req) => {
+                    const isProcessing = reviewing2faId === req.id;
+                    return (
+                      <div
+                        key={req.id}
+                        className="border border-slate-200 rounded-xl p-5 bg-slate-50/40 space-y-3"
+                      >
+                        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              <span className="font-semibold text-red-700">2FA Request</span>
+                              <span className="text-slate-300" aria-hidden="true">·</span>
+                              <span className="font-mono font-semibold text-slate-800">
+                                {req.requestType}
+                              </span>
+                            </div>
+                            <h3 className="text-sm font-semibold text-slate-900">
+                              {REQUEST_TYPE_LABELS[req.requestType]}
+                            </h3>
+                            <p className="text-xs text-slate-500">
+                              Requested by{' '}
+                              <span className="font-medium text-slate-800">
+                                {req.requesterEmail}
+                              </span>{' '}
+                              (<span className="capitalize">{req.requesterRole}</span>) on{' '}
+                              <span className="font-mono tabular-nums">
+                                {formatMytTimestamp(req.createdAt)}
+                              </span>
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() => handleAdmin2faReview(req, 'APPROVED')}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Approve &amp; Unlock 2FA</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() => handleAdmin2faReview(req, 'REJECTED')}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-50 transition-colors cursor-pointer"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              <span>Reject</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="text-xs text-slate-700">
+                          <span className="font-semibold text-slate-900">Justification: </span>
+                          <span>{req.reason}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Reviewed Governance History (Admin) */}
+              {(filteredGovernanceHistory.length > 0 || filtered2faHistory.length > 0) && (
+                <div className="pt-4 border-t border-slate-200 space-y-2.5">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Recent Reviewed Decisions (
+                    {filteredGovernanceHistory.length + filtered2faHistory.length})
+                  </h3>
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-medium">
+                          <th className="py-2 pl-4 pr-3">Reviewed (MYT)</th>
+                          <th className="py-2 px-3">Category</th>
+                          <th className="py-2 px-3">Target</th>
+                          <th className="py-2 px-3">Requester</th>
+                          <th className="py-2 px-3">Status</th>
+                          <th className="py-2 pl-3 pr-4">Reviewer · Note</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {filteredGovernanceHistory.slice(0, 15).map((req) => {
+                          const meta = GOV_STATUS_STYLES[req.status];
+                          return (
+                            <tr key={req.id} className="align-top">
+                              <td className="py-2.5 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
+                                {formatMytTimestamp(req.reviewedAt ?? req.createdAt)}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-700 whitespace-nowrap font-medium">
+                                {GOV_CATEGORY_LABELS[req.category]} ({req.operation})
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-900">
+                                {req.targetLabel}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">
+                                {req.requestedByEmail}
+                              </td>
+                              <td className="py-2.5 px-3 whitespace-nowrap">
+                                <span className={`font-semibold ${meta.className}`}>
+                                  {meta.label}
+                                </span>
+                              </td>
+                              <td className="py-2.5 pl-3 pr-4 text-slate-600">
+                                <div>{req.reviewedByEmail || '—'}</div>
+                                {req.reviewNote && (
+                                  <div className="text-slate-500 mt-0.5">{req.reviewNote}</div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {filtered2faHistory.slice(0, 10).map((req) => {
+                          const meta = TWO_FA_STATUS_STYLES[req.status];
+                          return (
+                            <tr key={req.id} className="align-top">
+                              <td className="py-2.5 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
+                                {formatMytTimestamp(req.reviewedAt ?? req.createdAt)}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-700 whitespace-nowrap font-medium">
+                                2FA Request
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-900">
+                                {REQUEST_TYPE_LABELS[req.requestType]}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">
+                                {req.requesterEmail}
+                              </td>
+                              <td className="py-2.5 px-3 whitespace-nowrap">
+                                <span className={`font-semibold ${meta.className}`}>
+                                  {meta.label}
+                                </span>
+                              </td>
+                              <td className="py-2.5 pl-3 pr-4 text-slate-600">
+                                {req.reviewedByEmail || '—'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            /* ---------------- NON-ADMIN PERSONAL SUBMISSION TRACKER ---------------- */
+            <>
+              {filteredGovernanceHistory.length === 0 && filtered2faHistory.length === 0 ? (
+                <div className="border border-dashed border-slate-200 rounded-lg px-6 py-10 text-center">
+                  <Clock className="w-6 h-6 text-slate-400 mx-auto mb-2" />
+                  <p className="text-sm font-semibold text-slate-900">
+                    No submitted requests in this category
+                  </p>
+                  <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                    Any client database edits, app configuration proposals, role elevation
+                    requests, or 2FA change requests you submit will appear here with real-time
+                    System Administrator review status.
+                  </p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-medium">
+                        <th className="py-2.5 pl-4 pr-3">Submitted (MYT)</th>
+                        <th className="py-2.5 px-3">Category</th>
+                        <th className="py-2.5 px-3">Target &amp; Summary</th>
+                        <th className="py-2.5 px-3">Reason</th>
+                        <th className="py-2.5 px-3">Status</th>
+                        <th className="py-2.5 pl-3 pr-4">Admin Review</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {filteredGovernanceHistory.map((req) => {
+                        const meta = GOV_STATUS_STYLES[req.status];
+                        return (
+                          <tr key={req.id} className="align-top">
+                            <td className="py-3 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
+                              {formatMytTimestamp(req.createdAt)}
+                            </td>
+                            <td className="py-3 px-3 font-medium text-slate-800 whitespace-nowrap">
+                              {GOV_CATEGORY_LABELS[req.category]} ({req.operation})
+                            </td>
+                            <td className="py-3 px-3 text-slate-800 max-w-xs">
+                              <div className="font-semibold text-slate-900">{req.targetLabel}</div>
+                              {req.previousSummary && (
+                                <div className="text-slate-500 mt-0.5">{req.previousSummary}</div>
+                              )}
+                            </td>
+                            <td className="py-3 px-3 text-slate-600 max-w-xs break-words">
+                              {req.reason}
+                            </td>
+                            <td className="py-3 px-3 whitespace-nowrap">
+                              <span className={`font-semibold ${meta.className}`}>
+                                {meta.label}
+                              </span>
+                            </td>
+                            <td className="py-3 pl-3 pr-4 text-slate-600">
+                              {req.reviewedByEmail ? (
+                                <>
+                                  <div className="font-medium text-slate-800">
+                                    {req.reviewedByEmail}
+                                  </div>
+                                  <div className="font-mono text-[11px] text-slate-400">
+                                    {formatMytTimestamp(req.reviewedAt ?? null)}
+                                  </div>
+                                  {req.reviewNote && (
+                                    <div className="text-slate-500 mt-0.5">{req.reviewNote}</div>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="text-slate-400">Awaiting review</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {filtered2faHistory.map((req) => {
+                        const meta = TWO_FA_STATUS_STYLES[req.status];
+                        return (
+                          <tr key={req.id} className="align-top">
+                            <td className="py-3 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
+                              {formatMytTimestamp(req.createdAt)}
+                            </td>
+                            <td className="py-3 px-3 font-medium text-slate-800 whitespace-nowrap">
+                              2FA Request
+                            </td>
+                            <td className="py-3 px-3 text-slate-900 font-semibold">
+                              {REQUEST_TYPE_LABELS[req.requestType]}
+                            </td>
+                            <td className="py-3 px-3 text-slate-600 max-w-xs break-words">
+                              {req.reason}
+                            </td>
+                            <td className="py-3 px-3 whitespace-nowrap">
+                              <span className={`font-semibold ${meta.className}`}>
+                                {meta.label}
+                              </span>
+                            </td>
+                            <td className="py-3 pl-3 pr-4 text-slate-600">
+                              {req.reviewedByEmail ? (
+                                <>
+                                  <div className="font-medium text-slate-800">
+                                    {req.reviewedByEmail}
+                                  </div>
+                                  <div className="font-mono text-[11px] text-slate-400">
+                                    {formatMytTimestamp(req.reviewedAt ?? null)}
+                                  </div>
+                                </>
+                              ) : (
+                                <span className="text-slate-400">Awaiting review</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </section>
+
+      {/* =================================================================== */}
       {/* SECTION A — Two-Factor Authentication (2FA) Protection (All Roles)  */}
       {/* =================================================================== */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -509,7 +1157,7 @@ export function DangerZoneView({
           <div>
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <KeyRound className="w-4 h-4 text-slate-600" />
-              <span>Section A — Two-Factor Authentication (2FA) Protection</span>
+              <span>Two-Factor Authentication (2FA) Protection</span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               Account: <span className="font-mono text-slate-700">{userProfile.email}</span> ·
@@ -528,7 +1176,6 @@ export function DangerZoneView({
         </div>
 
         <div className="p-6 space-y-6">
-          {/* Policy Lock Notice */}
           <div
             className={`p-4 rounded-lg border flex items-start gap-3 ${
               is2faUnlockedForChange
@@ -542,16 +1189,16 @@ export function DangerZoneView({
               <Lock className="w-4 h-4 text-red-600 mt-0.5 shrink-0" />
             )}
             <div className="text-xs leading-relaxed">
-              {is2faUnlockedForChange && activeApprovedRequest ? (
+              {is2faUnlockedForChange && activeApproved2faRequest ? (
                 <>
                   <p className="font-semibold text-teal-900">
                     Single-Use 2FA Change Window Active (Approved by{' '}
-                    {activeApprovedRequest.reviewedByEmail || 'System Administrator'})
+                    {activeApproved2faRequest.reviewedByEmail || 'System Administrator'})
                   </p>
                   <p className="mt-0.5 text-teal-800">
                     Approved action:{' '}
                     <span className="font-semibold">
-                      {REQUEST_TYPE_LABELS[activeApprovedRequest.requestType]}
+                      {REQUEST_TYPE_LABELS[activeApproved2faRequest.requestType]}
                     </span>
                     . Once you complete this change, your 2FA security lock will immediately
                     re-engage automatically.
@@ -572,7 +1219,6 @@ export function DangerZoneView({
             </div>
           </div>
 
-          {/* 2FA Controls (Locked by default unless admin unlocked a single-use window) */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Left: Locked / Unlocked 2FA Action Panel */}
             <div className="border border-slate-200 rounded-xl p-5 space-y-4">
@@ -610,7 +1256,7 @@ export function DangerZoneView({
                     </button>
                   </div>
                 </div>
-              ) : activeApprovedRequest?.requestType === 'DISABLE_2FA' ? (
+              ) : activeApproved2faRequest?.requestType === 'DISABLE_2FA' ? (
                 <div className="space-y-4">
                   <p className="text-xs text-slate-700 leading-relaxed">
                     Your request to disable Two-Factor Authentication has been approved. Confirm
@@ -753,7 +1399,7 @@ export function DangerZoneView({
                   id="twofa-request-type"
                   value={requestType}
                   onChange={(e) => setRequestType(e.target.value as TwoFactorRequestType)}
-                  disabled={submittingRequest || hasPendingRequest || is2faUnlockedForChange}
+                  disabled={submittingRequest || hasPending2faRequest || is2faUnlockedForChange}
                   className="w-full px-3 py-2 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700 disabled:bg-slate-50 disabled:text-slate-400"
                 >
                   <option value="RESET_2FA_SECRET">
@@ -777,7 +1423,7 @@ export function DangerZoneView({
                   maxLength={500}
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
-                  disabled={submittingRequest || hasPendingRequest || is2faUnlockedForChange}
+                  disabled={submittingRequest || hasPending2faRequest || is2faUnlockedForChange}
                   placeholder="Explain why you need to configure, reset, or disable 2FA (e.g., new mobile device, initial TOTP binding)..."
                   className="w-full px-3 py-2 text-xs text-slate-800 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700 disabled:bg-slate-50 disabled:text-slate-400 resize-none"
                 />
@@ -785,7 +1431,7 @@ export function DangerZoneView({
 
               <div className="flex items-center justify-between gap-3">
                 <span className="text-[11px] text-slate-500">
-                  {hasPendingRequest
+                  {hasPending2faRequest
                     ? 'You already have a pending request awaiting admin review.'
                     : is2faUnlockedForChange
                       ? 'Complete your active approved change first.'
@@ -795,7 +1441,7 @@ export function DangerZoneView({
                   type="submit"
                   disabled={
                     submittingRequest ||
-                    hasPendingRequest ||
+                    hasPending2faRequest ||
                     is2faUnlockedForChange ||
                     reason.trim().length < 5
                   }
@@ -807,246 +1453,18 @@ export function DangerZoneView({
               </div>
             </form>
           </div>
-
-          {/* Current User's Request History */}
-          <div className="border-t border-slate-200 pt-5">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-3">
-              Your 2FA Change Request History
-            </h3>
-
-            {myRequestsLoading ? (
-              <div className="text-xs text-slate-500 py-4">Loading your requests...</div>
-            ) : myRequests.length === 0 ? (
-              <div className="border border-dashed border-slate-200 rounded-lg px-5 py-6 text-center">
-                <Clock className="w-5 h-5 text-slate-400 mx-auto mb-2" />
-                <p className="text-xs font-medium text-slate-700">
-                  No 2FA change requests submitted yet
-                </p>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Any approval requests you submit will appear here with real-time review status.
-                </p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto border border-slate-200 rounded-lg">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-medium">
-                      <th className="py-2.5 pl-4 pr-3">Submitted (MYT)</th>
-                      <th className="py-2.5 px-3">Request Type</th>
-                      <th className="py-2.5 px-3">Reason</th>
-                      <th className="py-2.5 px-3">Status</th>
-                      <th className="py-2.5 pl-3 pr-4">Reviewed By</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {myRequests.map((req) => {
-                      const statusMeta = REQUEST_STATUS_STYLES[req.status];
-                      return (
-                        <tr key={req.id} className="align-top">
-                          <td className="py-3 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
-                            {formatMytTimestamp(req.createdAt)}
-                          </td>
-                          <td className="py-3 px-3 font-medium text-slate-900 whitespace-nowrap">
-                            {REQUEST_TYPE_LABELS[req.requestType]}
-                          </td>
-                          <td className="py-3 px-3 text-slate-600 max-w-md break-words">
-                            {req.reason}
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap">
-                            <span className={`font-semibold ${statusMeta.className}`}>
-                              {statusMeta.label}
-                            </span>
-                          </td>
-                          <td className="py-3 pl-3 pr-4 text-slate-600 whitespace-nowrap">
-                            {req.reviewedByEmail ? (
-                              <div>
-                                <div className="font-medium text-slate-800">
-                                  {req.reviewedByEmail}
-                                </div>
-                                <div className="font-mono text-[11px] text-slate-400">
-                                  {formatMytTimestamp(req.reviewedAt ?? null)}
-                                </div>
-                              </div>
-                            ) : (
-                              <span className="text-slate-400">—</span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
         </div>
       </section>
 
       {/* =================================================================== */}
-      {/* SECTION B — System Admin 2FA Approval Queue (Administrator ONLY)    */}
-      {/* =================================================================== */}
-      {isAdmin && (
-        <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-teal-700" />
-                <span>Section B — System Admin 2FA Approval Queue</span>
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Review pending user requests to unlock Two-Factor Authentication for a single
-                authorized change.
-              </p>
-            </div>
-            <span className="font-mono text-xs font-semibold text-slate-700 tabular-nums">
-              {pendingAdminRequests.length} pending
-            </span>
-          </div>
-
-          <div className="p-6 space-y-5">
-            {adminQueueLoading ? (
-              <div className="text-xs text-slate-500 py-4">
-                Loading 2FA approval queue...
-              </div>
-            ) : pendingAdminRequests.length === 0 ? (
-              <div className="border border-dashed border-slate-200 rounded-lg px-6 py-10 text-center">
-                <CheckCircle2 className="w-6 h-6 text-slate-400 mx-auto mb-2" />
-                <p className="text-sm font-semibold text-slate-900">
-                  No pending 2FA change requests
-                </p>
-                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                  When any user, manager, or administrator submits a 2FA change request, it will
-                  appear here in real time for your approval or rejection.
-                </p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto border border-slate-200 rounded-lg">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-medium">
-                      <th className="py-2.5 pl-4 pr-3">Requested (MYT)</th>
-                      <th className="py-2.5 px-3">Requester</th>
-                      <th className="py-2.5 px-3">Action Requested</th>
-                      <th className="py-2.5 px-3">Justification</th>
-                      <th className="py-2.5 pl-3 pr-4 text-right">Admin Decision</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {pendingAdminRequests.map((req) => {
-                      const isProcessing = reviewingId === req.id;
-                      return (
-                        <tr key={req.id} className="align-top">
-                          <td className="py-3.5 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
-                            {formatMytTimestamp(req.createdAt)}
-                          </td>
-                          <td className="py-3.5 px-3 whitespace-nowrap">
-                            <div className="font-medium text-slate-900">
-                              {req.requesterEmail}
-                            </div>
-                            <div className="text-slate-500 capitalize mt-0.5">
-                              {req.requesterRole}
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-3 whitespace-nowrap">
-                            <div className="font-semibold text-slate-900">
-                              {REQUEST_TYPE_LABELS[req.requestType]}
-                            </div>
-                            <div className="font-mono text-[11px] text-slate-400 mt-0.5">
-                              {req.requestType}
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-3 text-slate-600 max-w-md break-words leading-relaxed">
-                            {req.reason}
-                          </td>
-                          <td className="py-3.5 pl-3 pr-4 whitespace-nowrap text-right">
-                            <div className="inline-flex items-center gap-2">
-                              <button
-                                type="button"
-                                disabled={isProcessing}
-                                onClick={() => handleAdminReview(req, 'APPROVED')}
-                                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors cursor-pointer"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>Approve</span>
-                              </button>
-                              <button
-                                type="button"
-                                disabled={isProcessing}
-                                onClick={() => handleAdminReview(req, 'REJECTED')}
-                                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-50 transition-colors cursor-pointer"
-                              >
-                                <XCircle className="w-3.5 h-3.5" />
-                                <span>Reject</span>
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {reviewedAdminRequests.length > 0 && (
-              <div className="pt-2">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2.5">
-                  Recent Governance Decisions ({reviewedAdminRequests.length})
-                </h3>
-                <div className="overflow-x-auto border border-slate-200 rounded-lg">
-                  <table className="w-full text-left border-collapse text-xs">
-                    <thead>
-                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-medium">
-                        <th className="py-2 pl-4 pr-3">Reviewed (MYT)</th>
-                        <th className="py-2 px-3">Requester</th>
-                        <th className="py-2 px-3">Request Type</th>
-                        <th className="py-2 px-3">Outcome</th>
-                        <th className="py-2 pl-3 pr-4">Reviewer</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {reviewedAdminRequests.slice(0, 10).map((req) => {
-                        const statusMeta = REQUEST_STATUS_STYLES[req.status];
-                        return (
-                          <tr key={req.id}>
-                            <td className="py-2.5 pl-4 pr-3 font-mono text-slate-600 whitespace-nowrap tabular-nums">
-                              {formatMytTimestamp(req.reviewedAt ?? req.createdAt)}
-                            </td>
-                            <td className="py-2.5 px-3 text-slate-800 whitespace-nowrap">
-                              {req.requesterEmail}
-                            </td>
-                            <td className="py-2.5 px-3 text-slate-700 whitespace-nowrap">
-                              {REQUEST_TYPE_LABELS[req.requestType]}
-                            </td>
-                            <td className="py-2.5 px-3 whitespace-nowrap">
-                              <span className={`font-semibold ${statusMeta.className}`}>
-                                {statusMeta.label}
-                              </span>
-                            </td>
-                            <td className="py-2.5 pl-3 pr-4 text-slate-600 whitespace-nowrap">
-                              {req.reviewedByEmail || '—'}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-      )}
-
-      {/* =================================================================== */}
-      {/* SECTION C — Critical System Actions (Administrator ONLY)            */}
+      {/* CRITICAL SYSTEM ACTIONS (Administrator ONLY)                        */}
       {/* =================================================================== */}
       {isAdmin && (
         <section className="bg-white border border-red-200 rounded-xl overflow-hidden">
           <div className="px-6 py-4 bg-red-50/60 border-b border-red-200">
             <h2 className="text-sm font-semibold text-red-900 flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-red-600" />
-              <span>Section C — Critical System Actions (Administrator Only)</span>
+              <span>Critical System Actions (Administrator Only)</span>
             </h2>
             <p className="text-xs text-red-800/80 mt-0.5">
               Organization-wide security enforcement and irreversible data purge operations.
@@ -1055,7 +1473,7 @@ export function DangerZoneView({
           </div>
 
           <div className="divide-y divide-slate-200">
-            {/* C1: Global Mandatory 2FA Policy */}
+            {/* Global Mandatory 2FA Policy */}
             <div className="p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
               <div className="space-y-1 max-w-2xl">
                 <h3 className="text-sm font-semibold text-slate-900">
@@ -1101,7 +1519,7 @@ export function DangerZoneView({
               </button>
             </div>
 
-            {/* C2: Permanent Client Record Purge */}
+            {/* Permanent Client Record Purge */}
             <form onSubmit={handlePurgeClient} className="p-6 space-y-4">
               <div className="space-y-1">
                 <h3 className="text-sm font-semibold text-red-900 flex items-center gap-1.5">
