@@ -1,8 +1,8 @@
 {
   "entities": {
-    "AdminUser": {
-      "title": "AdminUser",
-      "description": "Trusted registry of tax firm staff with administrative access.",
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with RBAC role (administrator, manager, user).",
       "type": "object",
       "properties": {
         "uid": {
@@ -22,12 +22,21 @@
           "minLength": 1,
           "maxLength": 120
         },
+        "role": {
+          "type": "string",
+          "enum": ["administrator", "manager", "user"]
+        },
+        "assignedClientId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
         }
       },
-      "required": ["uid", "email", "displayName", "createdAt"]
+      "required": ["uid", "email", "displayName", "role", "createdAt"]
     },
     "TaxClient": {
       "title": "TaxClient",
@@ -88,6 +97,10 @@
         "latestReminderDraft": {
           "type": "string",
           "maxLength": 2500
+        },
+        "assignedTo": {
+          "type": "object",
+          "description": "Staff or manager assigned to this client engagement."
         },
         "requiredDocuments": {
           "type": "array",
@@ -243,12 +256,63 @@
         "missingDocuments",
         "createdAt"
       ]
+    },
+    "AuditLogEntry": {
+      "title": "AuditLogEntry",
+      "description": "Immutable, append-only activity and compliance audit log entry across user sessions and tax operations.",
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "userRole": {
+          "type": "string",
+          "enum": ["administrator", "manager", "user"]
+        },
+        "pageVisited": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "actionTaken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "details": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1500
+        }
+      },
+      "required": [
+        "timestamp",
+        "userId",
+        "userEmail",
+        "userRole",
+        "pageVisited",
+        "actionTaken",
+        "details"
+      ]
     }
   },
   "firestore": {
-    "/admins/{uid}": {
-      "schema": { "$ref": "#/entities/AdminUser" },
-      "description": "Trusted staff admin accounts."
+    "/users/{uid}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profiles and RBAC role assignments."
     },
     "/clients/{clientId}": {
       "schema": { "$ref": "#/entities/TaxClient" },
@@ -261,6 +325,10 @@
     "/clients/{clientId}/reminders/{reminderId}": {
       "schema": { "$ref": "#/entities/ReminderLog" },
       "description": "Audit trail of automated and manual follow-up reminders dispatched for a client."
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLogEntry" },
+      "description": "Immutable append-only activity log recording user navigation, uploads, verifications, status changes, assignments, reminders, and role changes."
     }
   }
 }

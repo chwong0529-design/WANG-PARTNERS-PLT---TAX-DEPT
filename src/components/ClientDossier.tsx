@@ -19,6 +19,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   FileCheck,
+  UserCheck,
 } from 'lucide-react';
 import {
   ALL_STANDARD_DOC_TYPES,
@@ -29,10 +30,14 @@ import {
   type ReminderChannel,
   type ReminderLogRecord,
   type TaxClient,
+  type UserProfile,
+  type UserRole,
   type VerificationApiResponse,
 } from '../types/tax';
 import {
   applyAiVerificationResult,
+  assignClientToStaff,
+  computeJobStatusFromChecklist,
   deleteTaxClient,
   determineWorkflowStage,
   dispatchReminder,
@@ -43,11 +48,13 @@ import {
   updateClientChecklistStructure,
   verifyTaxDocumentsApi,
 } from '../lib/taxService';
+import { logActivity } from '../lib/auditService';
 import { DocumentStatusText, formatMyr, JobStatusText } from './StatusIndicator';
 
 interface ClientDossierProps {
   client: TaxClient;
-  isAdmin: boolean;
+  userRole: UserRole;
+  staffProfiles: UserProfile[];
   portalMode: 'staff' | 'client';
   userEmail: string;
   onBack?: () => void;
@@ -57,14 +64,15 @@ interface ClientDossierProps {
 
 export function ClientDossier({
   client,
-  isAdmin,
+  userRole,
+  staffProfiles,
   portalMode,
   userEmail,
   onBack,
   onTogglePortalPreview,
   onDeleted,
 }: ClientDossierProps) {
-  const isStaffView = isAdmin && portalMode === 'staff';
+  const isStaffView = (userRole === 'administrator' || userRole === 'manager') && portalMode === 'staff';
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
@@ -80,6 +88,7 @@ export function ClientDossier({
   const [newDocName, setNewDocName] = useState('');
   const [addingDoc, setAddingDoc] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [assigningStaff, setAssigningStaff] = useState(false);
 
   // Reminder composer state (Staff)
   const workflow = determineWorkflowStage(client);
@@ -105,7 +114,7 @@ export function ClientDossier({
   useEffect(() => {
     const unsub = subscribeToClientHistory(
       client.clientId,
-      isAdmin,
+      userRole === 'administrator' || userRole === 'manager',
       userEmail,
       setVerifications,
       setReminders,
@@ -114,7 +123,7 @@ export function ClientDossier({
       }
     );
     return () => unsub();
-  }, [client.clientId, isAdmin, userEmail]);
+  }, [client.clientId, userRole, userEmail]);
 
   const handleFilesSelected = (incoming: FileList | File[]) => {
     const accepted = Array.from(incoming).filter(
@@ -131,6 +140,11 @@ export function ClientDossier({
     setStagedFiles((prev) => [...prev, ...accepted].slice(0, 10));
   };
 
+  const pageLabel =
+    portalMode === 'client'
+      ? `Client Portal (${client.clientId})`
+      : `Client Dossier (${client.clientId})`;
+
   const handleRunVerification = async () => {
     if (stagedFiles.length === 0) return;
     if (client.isLocked && !isStaffView) {
@@ -139,11 +153,39 @@ export function ClientDossier({
     }
     setVerifying(true);
     setVerifyError(null);
+    const fileNames = stagedFiles.map((f) => f.name);
+    const previousStatus = client.jobStatus;
+
+    void logActivity({
+      pageVisited: pageLabel,
+      actionTaken: 'UPLOAD_TAX_DOCUMENT',
+      details: `Uploaded ${fileNames.length} tax document${fileNames.length === 1 ? '' : 's'} for ${client.clientId} (${client.name}): ${fileNames.join(', ')}.`,
+    });
+
     try {
       const result = await verifyTaxDocumentsApi(client, stagedFiles);
       setLastAiResult(result);
-      await applyAiVerificationResult(client, result);
+      const finalStatus = await applyAiVerificationResult(client, result);
       setStagedFiles([]);
+
+      const missingSummary =
+        result.missingDocuments.length === 0
+          ? '0 missing documents'
+          : `${result.missingDocuments.length} missing (${result.missingDocuments.join(', ')})`;
+
+      void logActivity({
+        pageVisited: pageLabel,
+        actionTaken: 'AI_DOCUMENT_VERIFICATION',
+        details: `Gemini AI verified ${result.detectedDocuments.length} document${result.detectedDocuments.length === 1 ? '' : 's'} for ${client.clientId}: ${missingSummary}. Recommended status: "${result.recommendedJobStatus}".`,
+      });
+
+      if (finalStatus !== previousStatus) {
+        void logActivity({
+          pageVisited: pageLabel,
+          actionTaken: 'JOB_STATUS_CHANGE',
+          details: `Client ${client.clientId} (${client.name}) job status changed from "${previousStatus}" to "${finalStatus}" after AI document verification.`,
+        });
+      }
     } catch (err) {
       setVerifyError(err instanceof Error ? err.message : 'Document verification failed.');
     } finally {
@@ -152,7 +194,9 @@ export function ClientDossier({
   };
 
   const handleManualStatusChange = async (idx: number, status: DocumentStatus) => {
-    await updateClientChecklistItem(client, idx, {
+    const targetDoc = client.requiredDocuments[idx];
+    const previousStatus = client.jobStatus;
+    const updates = {
       status,
       taxYearValid: status === 'Verified' ? true : status === 'Invalid' ? false : null,
       notes:
@@ -161,6 +205,18 @@ export function ClientDossier({
           : status === 'Invalid'
             ? 'Flagged for re-upload by tax staff.'
             : '',
+    };
+    const nextDocs = client.requiredDocuments.map((item, i) =>
+      i === idx ? { ...item, ...updates } : item
+    );
+    const nextStatus = computeJobStatusFromChecklist(nextDocs);
+
+    await updateClientChecklistItem(client, idx, updates);
+
+    void logActivity({
+      pageVisited: pageLabel,
+      actionTaken: 'JOB_STATUS_CHANGE',
+      details: `Updated "${targetDoc?.docType || 'Document'}" to "${status}" for ${client.clientId}. Job status: "${previousStatus}" -> "${nextStatus}".`,
     });
   };
 
@@ -169,28 +225,91 @@ export function ClientDossier({
     if (!clean) return;
     if (client.requiredDocuments.length >= BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS) return;
     setAddingDoc(true);
+    const previousStatus = client.jobStatus;
     try {
-      await updateClientChecklistStructure(client, [
+      const nextDocs = [
         ...client.requiredDocuments,
         {
           docType: clean,
-          status: 'Missing',
+          status: 'Missing' as const,
           fileName: null,
           fileUrl: null,
           extractedAmount: null,
           taxYearValid: null,
           notes: '',
         },
-      ]);
+      ];
+      const nextStatus = computeJobStatusFromChecklist(nextDocs);
+      await updateClientChecklistStructure(client, nextDocs);
       setNewDocName('');
+      if (nextStatus !== previousStatus) {
+        void logActivity({
+          pageVisited: pageLabel,
+          actionTaken: 'JOB_STATUS_CHANGE',
+          details: `Added checklist requirement "${clean}" to ${client.clientId}. Job status changed from "${previousStatus}" to "${nextStatus}".`,
+        });
+      }
     } finally {
       setAddingDoc(false);
     }
   };
 
   const handleRemoveChecklistDoc = async (idx: number) => {
+    const removedDoc = client.requiredDocuments[idx]?.docType || 'Document';
+    const previousStatus = client.jobStatus;
     const next = client.requiredDocuments.filter((_, i) => i !== idx);
+    const nextStatus = computeJobStatusFromChecklist(next);
     await updateClientChecklistStructure(client, next);
+    if (nextStatus !== previousStatus) {
+      void logActivity({
+        pageVisited: pageLabel,
+        actionTaken: 'JOB_STATUS_CHANGE',
+        details: `Removed checklist requirement "${removedDoc}" from ${client.clientId}. Job status changed from "${previousStatus}" to "${nextStatus}".`,
+      });
+    }
+  };
+
+  const handleStaffAssignment = async (staffUid: string) => {
+    setAssigningStaff(true);
+    const previousAssignee = client.assignedTo?.email || 'Unassigned';
+    try {
+      if (!staffUid) {
+        await assignClientToStaff(client.clientId, null);
+        void logActivity({
+          pageVisited: pageLabel,
+          actionTaken: 'ASSIGN_DUTY',
+          details: `Unassigned client ${client.clientId} (${client.name}) — previously assigned to ${previousAssignee}.`,
+        });
+      } else {
+        const found = staffProfiles.find((p) => p.uid === staffUid);
+        if (found) {
+          await assignClientToStaff(client.clientId, {
+            uid: found.uid,
+            name: found.displayName,
+            email: found.email,
+          });
+          void logActivity({
+            pageVisited: pageLabel,
+            actionTaken: 'ASSIGN_DUTY',
+            details: `Assigned client ${client.clientId} (${client.name}) to ${found.displayName} (${found.email}, ${found.role}) — previously ${previousAssignee}.`,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to assign staff:', err);
+    } finally {
+      setAssigningStaff(false);
+    }
+  };
+
+  const handleToggleLock = async () => {
+    const nextLocked = !client.isLocked;
+    await toggleClientLock(client, nextLocked);
+    void logActivity({
+      pageVisited: pageLabel,
+      actionTaken: 'TOGGLE_FILE_LOCK',
+      details: `${nextLocked ? 'Locked' : 'Unlocked'} tax file ${client.clientId} (${client.name}) for LHDN computation.`,
+    });
   };
 
   const handleGenerateAiReminder = async () => {
@@ -214,6 +333,11 @@ export function ClientDossier({
     setReminderFeedback(null);
     try {
       await dispatchReminder(client, workflow.stage, reminderChannel, reminderText);
+      void logActivity({
+        pageVisited: pageLabel,
+        actionTaken: 'DISPATCH_REMINDER',
+        details: `Dispatched "${workflow.stage}" reminder via ${reminderChannel} to ${client.name} (${client.clientId}, ${client.email}).`,
+      });
       setReminderFeedback(
         `Reminder logged (${reminderChannel}) and client reminder timestamp updated.`
       );
@@ -235,7 +359,13 @@ export function ClientDossier({
   };
 
   const handleDelete = async () => {
+    if (userRole !== 'administrator') return;
     await deleteTaxClient(client.clientId);
+    void logActivity({
+      pageVisited: pageLabel,
+      actionTaken: 'DELETE_CLIENT',
+      details: `Deleted client tax file ${client.clientId} (${client.name}, ${client.email}).`,
+    });
     onDeleted?.();
   };
 
@@ -252,6 +382,9 @@ export function ClientDossier({
   const whatsappHref = cleanPhone
     ? `https://wa.me/${cleanPhone}?text=${encodeURIComponent(reminderText)}`
     : null;
+  const activeStaffList = staffProfiles.filter(
+    (p) => p.role === 'administrator' || p.role === 'manager'
+  );
 
   return (
     <div className="space-y-6">
@@ -296,26 +429,50 @@ export function ClientDossier({
               <JobStatusText status={client.jobStatus} />
             </div>
 
-            <p className="text-xs text-slate-500">
-              {client.email}
-              {client.phone ? ` · ${client.phone}` : ''}
-              {' · '}
+            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500 pt-1">
+              <span>
+                {client.email}
+                {client.phone ? ` · ${client.phone}` : ''}
+              </span>
+              <span aria-hidden="true">·</span>
               <span className="font-mono tabular-nums text-slate-700">
                 {verifiedCount} of {totalCount} required documents verified
               </span>
               {totalExtractedMyr > 0 && (
                 <>
-                  {' · '}
+                  <span aria-hidden="true">·</span>
                   <span className="font-mono tabular-nums text-slate-700">
                     Extracted totals: {formatMyr(totalExtractedMyr)}
                   </span>
                 </>
               )}
-            </p>
+            </div>
+
+            {isStaffView && (
+              <div className="pt-2 flex items-center gap-2 text-xs">
+                <span className="font-medium text-slate-700 flex items-center gap-1">
+                  <UserCheck className="w-3.5 h-3.5 text-teal-700" />
+                  <span>Assigned Staff:</span>
+                </span>
+                <select
+                  value={client.assignedTo?.uid || ''}
+                  disabled={assigningStaff}
+                  onChange={(e) => handleStaffAssignment(e.target.value)}
+                  className="px-2.5 py-1 text-xs font-medium bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700 cursor-pointer"
+                >
+                  <option value="">Unassigned</option>
+                  {activeStaffList.map((st) => (
+                    <option key={st.uid} value={st.uid}>
+                      {st.displayName} ({st.role})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
-            {isAdmin && onTogglePortalPreview && (
+            {userRole !== 'user' && onTogglePortalPreview && (
               <button
                 type="button"
                 onClick={onTogglePortalPreview}
@@ -332,7 +489,7 @@ export function ClientDossier({
               <>
                 <button
                   type="button"
-                  onClick={() => toggleClientLock(client, !client.isLocked)}
+                  onClick={handleToggleLock}
                   className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {client.isLocked ? (
@@ -348,33 +505,37 @@ export function ClientDossier({
                   )}
                 </button>
 
-                {!confirmDelete ? (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmDelete(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-red-700 bg-white border border-slate-200 rounded-lg hover:bg-red-50 hover:border-red-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Delete</span>
-                  </button>
-                ) : (
-                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-red-50 border border-red-200 rounded-lg text-xs">
-                    <span className="text-red-800 font-medium">Confirm delete?</span>
-                    <button
-                      type="button"
-                      onClick={handleDelete}
-                      className="px-2 py-0.5 text-white bg-red-700 rounded hover:bg-red-800 cursor-pointer"
-                    >
-                      Yes
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDelete(false)}
-                      className="px-2 py-0.5 text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 cursor-pointer"
-                    >
-                      No
-                    </button>
-                  </div>
+                {userRole === 'administrator' && (
+                  <>
+                    {!confirmDelete ? (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(true)}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-red-700 bg-white border border-slate-200 rounded-lg hover:bg-red-50 hover:border-red-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Delete</span>
+                      </button>
+                    ) : (
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-red-50 border border-red-200 rounded-lg text-xs">
+                        <span className="text-red-800 font-medium">Confirm delete?</span>
+                        <button
+                          type="button"
+                          onClick={handleDelete}
+                          className="px-2 py-0.5 text-white bg-red-700 rounded hover:bg-red-800 cursor-pointer"
+                        >
+                          Yes
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDelete(false)}
+                          className="px-2 py-0.5 text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 cursor-pointer"
+                        >
+                          No
+                        </button>
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -382,7 +543,7 @@ export function ClientDossier({
         </div>
 
         {/* Client Portal Preview Notice */}
-        {portalMode === 'client' && isAdmin && (
+        {portalMode === 'client' && userRole !== 'user' && (
           <div className="mt-4 pt-3 border-t border-slate-200 text-xs text-teal-800 flex items-center justify-between gap-4">
             <span>
               Viewing the simplified taxpayer upload portal for {client.name}. Uploads here run live Gemini 2.5 Flash verification and update Firestore immediately.

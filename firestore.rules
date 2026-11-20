@@ -9,7 +9,7 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
-    // Reusable Security Primitives
+    // Reusable Security Primitives & RBAC Helpers
     // -------------------------------------------------------------------------
     function incoming() {
       return request.resource.data;
@@ -27,17 +27,25 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
-    // Pure token check (no get/exists) safe for use inside allow list rules
-    function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'chwong0529@gmail.com';
+    function getUserRole(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid))
+        ? get(/databases/$(database)/documents/users/$(uid)).data.role
+        : 'user';
     }
 
-    // Full admin check for single-document operations (never called inside allow list)
     function isAdmin() {
-      return isBootstrappedAdmin() || (
-        isVerifiedUser() &&
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      return isVerifiedUser() && (
+        request.auth.token.email == 'chwong0529@gmail.com' ||
+        getUserRole(request.auth.uid) == 'administrator'
       );
+    }
+
+    function isManager() {
+      return isVerifiedUser() && getUserRole(request.auth.uid) == 'manager';
+    }
+
+    function isStaffOrManager() {
+      return isAdmin() || isManager();
     }
 
     function isValidId(id) {
@@ -58,125 +66,94 @@ service cloud.firestore {
       );
     }
 
-    // -------------------------------------------------------------------------
-    // Validation Blueprints (Anti-Update-Gap Helpers)
-    // -------------------------------------------------------------------------
-    function isValidAdminDoc(data) {
-      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt']) &&
-        data.keys().hasOnly(['uid', 'email', 'displayName', 'createdAt']) &&
-        isValidId(data.uid) &&
-        isValidEmailStr(data.email) &&
-        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
-        data.createdAt is timestamp;
+    function isValidUserProfile(data) {
+      return data.keys().hasOnly([
+        'uid',
+        'email',
+        'displayName',
+        'role',
+        'assignedClientId',
+        'createdAt'
+      ]) &&
+      isValidId(data.uid) &&
+      isValidEmailStr(data.email) &&
+      data.displayName is string &&
+      data.displayName.size() >= 1 &&
+      data.displayName.size() <= 120 &&
+      data.role in ['administrator', 'manager', 'user'] &&
+      (data.assignedClientId == null || (data.assignedClientId is string && data.assignedClientId.size() <= 64)) &&
+      data.createdAt is timestamp;
     }
 
-    function isValidClientDoc(data) {
-      return data.keys().hasAll([
-          'clientId', 'ownerUid', 'name', 'email', 'phone',
-          'taxYear', 'filingCategory', 'jobStatus', 'isLocked',
-          'reminderCount', 'latestReminderDraft', 'requiredDocuments',
-          'createdAt', 'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'clientId', 'ownerUid', 'name', 'email', 'phone',
-          'taxYear', 'filingCategory', 'jobStatus', 'isLocked',
-          'reminderCount', 'lastReminderSent', 'latestReminderDraft',
-          'requiredDocuments', 'createdAt', 'updatedAt'
-        ]) &&
-        data.clientId is string && data.clientId.size() >= 3 && data.clientId.size() <= 64 &&
-        data.clientId.matches('^[a-zA-Z0-9_\\-]+$') &&
-        isValidId(data.ownerUid) &&
-        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
-        isValidEmailStr(data.email) &&
-        data.phone is string && data.phone.size() <= 32 &&
-        data.taxYear is int && data.taxYear >= 2020 && data.taxYear <= 2035 &&
-        data.filingCategory in [
-          'Form BE (Salaried)',
-          'Form B (Business / Commission)',
-          'Form M (Non-Resident)'
-        ] &&
-        data.jobStatus in ['No Book In', 'Pending Document', 'Book In Can Start'] &&
-        data.isLocked is bool &&
-        data.reminderCount is int && data.reminderCount >= 0 && data.reminderCount <= 100 &&
-        (!('lastReminderSent' in data) || data.lastReminderSent == null || data.lastReminderSent is timestamp) &&
-        data.latestReminderDraft is string && data.latestReminderDraft.size() <= 2500 &&
-        data.requiredDocuments is list &&
-        data.requiredDocuments.size() <= 20 &&
-        (data.requiredDocuments.size() == 0 || data.requiredDocuments[0] is map) &&
-        data.createdAt is timestamp &&
-        data.updatedAt is timestamp;
-    }
-
-    function isValidVerificationDoc(data) {
-      return data.keys().hasAll([
-          'clientId', 'clientOwnerUid', 'clientEmail', 'submittedByUid',
-          'recommendedJobStatus', 'automatedReminderDraft',
-          'detectedDocuments', 'missingDocuments', 'createdAt'
-        ]) &&
-        data.keys().hasOnly([
-          'clientId', 'clientOwnerUid', 'clientEmail', 'submittedByUid',
-          'recommendedJobStatus', 'automatedReminderDraft',
-          'detectedDocuments', 'missingDocuments', 'createdAt'
-        ]) &&
-        data.clientId is string && data.clientId.size() >= 3 && data.clientId.size() <= 64 &&
-        data.clientId.matches('^[a-zA-Z0-9_\\-]+$') &&
-        isValidId(data.clientOwnerUid) &&
-        isValidEmailStr(data.clientEmail) &&
-        isValidId(data.submittedByUid) &&
-        data.recommendedJobStatus in ['No Book In', 'Pending Document', 'Book In Can Start'] &&
-        data.automatedReminderDraft is string && data.automatedReminderDraft.size() <= 2500 &&
-        data.detectedDocuments is list &&
-        data.detectedDocuments.size() <= 20 &&
-        (data.detectedDocuments.size() == 0 || data.detectedDocuments[0] is map) &&
-        data.missingDocuments is list &&
-        data.missingDocuments.size() <= 20 &&
-        (data.missingDocuments.size() == 0 || data.missingDocuments[0] is string) &&
-        data.createdAt is timestamp;
-    }
-
-    function isValidReminderDoc(data) {
-      return data.keys().hasAll([
-          'clientId', 'clientOwnerUid', 'clientEmail', 'sentByUid',
-          'stage', 'channel', 'message', 'missingDocuments', 'createdAt'
-        ]) &&
-        data.keys().hasOnly([
-          'clientId', 'clientOwnerUid', 'clientEmail', 'sentByUid',
-          'stage', 'channel', 'message', 'missingDocuments', 'createdAt'
-        ]) &&
-        data.clientId is string && data.clientId.size() >= 3 && data.clientId.size() <= 64 &&
-        data.clientId.matches('^[a-zA-Z0-9_\\-]+$') &&
-        isValidId(data.clientOwnerUid) &&
-        isValidEmailStr(data.clientEmail) &&
-        isValidId(data.sentByUid) &&
-        data.stage in ['Initial Outreach', '7-Day Follow-up', 'Missing Doc Alert', 'Ready for Tax Prep'] &&
-        data.channel in ['Email', 'WhatsApp', 'Portal'] &&
-        data.message is string && data.message.size() >= 1 && data.message.size() <= 2500 &&
-        data.missingDocuments is list &&
-        data.missingDocuments.size() <= 20 &&
-        (data.missingDocuments.size() == 0 || data.missingDocuments[0] is string) &&
-        data.createdAt is timestamp;
+    function isValidAuditLog(data) {
+      return data.keys().hasOnly([
+        'timestamp',
+        'userId',
+        'userEmail',
+        'userRole',
+        'pageVisited',
+        'actionTaken',
+        'details'
+      ]) &&
+      data.timestamp is timestamp &&
+      isValidId(data.userId) &&
+      isValidEmailStr(data.userEmail) &&
+      data.userRole in ['administrator', 'manager', 'user'] &&
+      data.pageVisited is string &&
+      data.pageVisited.size() >= 1 &&
+      data.pageVisited.size() <= 160 &&
+      data.actionTaken is string &&
+      data.actionTaken.size() >= 1 &&
+      data.actionTaken.size() <= 80 &&
+      data.details is string &&
+      data.details.size() <= 1500;
     }
 
     // -------------------------------------------------------------------------
-    // Collection: /admins/{uid}
+    // Collection: /users/{uid}
     // -------------------------------------------------------------------------
-    match /admins/{uid} {
-      allow get: if isVerifiedUser() && isValidId(uid) && (request.auth.uid == uid || isAdmin());
-      allow list: if isBootstrappedAdmin();
+    match /users/{uid} {
+      allow get: if isVerifiedUser() && isValidId(uid) && (request.auth.uid == uid || isStaffOrManager());
+      allow list: if isStaffOrManager();
+
       allow create: if isVerifiedUser() &&
         isValidId(uid) &&
-        isValidAdminDoc(incoming()) &&
-        incoming().uid == uid &&
-        incoming().createdAt == request.time &&
-        isAdmin();
+        request.auth.uid == uid &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        (
+          incoming().role == 'user' ||
+          (request.auth.token.email == 'chwong0529@gmail.com' && incoming().role == 'administrator')
+        );
+
       allow update: if isVerifiedUser() &&
         isValidId(uid) &&
-        isValidAdminDoc(incoming()) &&
+        isValidUserProfile(incoming()) &&
         incoming().uid == existing().uid &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email']) &&
-        isAdmin();
-      allow delete: if isVerifiedUser() && isValidId(uid) && isAdmin();
+        (
+          isAdmin() ||
+          (request.auth.uid == uid && incoming().role == existing().role)
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection: /audit_logs/{logId} (Strictly Immutable Append-Only)
+    // -------------------------------------------------------------------------
+    match /audit_logs/{logId} {
+      allow get: if isStaffOrManager() && isValidId(logId);
+      allow list: if isStaffOrManager();
+
+      allow create: if isVerifiedUser() &&
+        isValidId(logId) &&
+        isValidAuditLog(incoming()) &&
+        incoming().userId == request.auth.uid &&
+        incoming().userEmail.lower() == request.auth.token.email.lower() &&
+        incoming().timestamp == request.time;
+
+      allow update: if false;
+      allow delete: if false;
     }
 
     // -------------------------------------------------------------------------
@@ -185,68 +162,41 @@ service cloud.firestore {
     match /clients/{clientId} {
       allow get: if isVerifiedUser() &&
         isValidId(clientId) &&
-        (isClientOwner(existing()) || isAdmin());
+        (isStaffOrManager() || isClientOwner(existing()));
 
-      allow list: if isBootstrappedAdmin() || (
+      allow list: if isStaffOrManager() || (
         isVerifiedUser() &&
         (existing().ownerUid == request.auth.uid || existing().email == request.auth.token.email)
       );
 
       allow create: if isVerifiedUser() &&
         isValidId(clientId) &&
-        incoming().clientId == clientId &&
-        isValidClientDoc(incoming()) &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time &&
-        (
-          (
-            incoming().ownerUid == request.auth.uid &&
-            incoming().email == request.auth.token.email &&
-            incoming().isLocked == false &&
-            incoming().reminderCount == 0
-          ) ||
-          isAdmin()
-        );
+        (isStaffOrManager() || incoming().ownerUid == request.auth.uid);
 
       allow update: if isVerifiedUser() &&
         isValidId(clientId) &&
-        isValidClientDoc(incoming()) &&
-        incoming().clientId == existing().clientId &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
         (
-          // Tier 1: Tax firm staff admin
-          isAdmin() ||
-          // Tier 2: Verified taxpayer submitting verified document updates on an unlocked file
+          isStaffOrManager() ||
           (
             existing().isLocked == false &&
             incoming().isLocked == false &&
-            incoming().ownerUid == existing().ownerUid &&
-            isClientOwner(existing()) &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'requiredDocuments',
-              'jobStatus',
-              'latestReminderDraft',
-              'updatedAt'
-            ])
+            isClientOwner(existing())
           )
         );
 
-      allow delete: if isVerifiedUser() && isValidId(clientId) && isAdmin();
+      allow delete: if isAdmin();
 
-      // -----------------------------------------------------------------------
       // Subcollection: /clients/{clientId}/verifications/{verificationId}
-      // -----------------------------------------------------------------------
       match /verifications/{verificationId} {
         allow get: if isVerifiedUser() &&
           isValidId(clientId) &&
           isValidId(verificationId) &&
           (
-            isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data) ||
-            isAdmin()
+            isStaffOrManager() ||
+            isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data)
           );
 
-        allow list: if isBootstrappedAdmin() || (
+        allow list: if isStaffOrManager() || (
           isVerifiedUser() &&
           (existing().clientOwnerUid == request.auth.uid || existing().clientEmail == request.auth.token.email)
         );
@@ -254,38 +204,27 @@ service cloud.firestore {
         allow create: if isVerifiedUser() &&
           isValidId(clientId) &&
           isValidId(verificationId) &&
-          isValidVerificationDoc(incoming()) &&
-          incoming().clientId == clientId &&
-          incoming().submittedByUid == request.auth.uid &&
-          incoming().createdAt == request.time &&
           exists(/databases/$(database)/documents/clients/$(clientId)) &&
           (
-            isAdmin() ||
-            (
-              isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data) &&
-              get(/databases/$(database)/documents/clients/$(clientId)).data.isLocked == false &&
-              incoming().clientOwnerUid == get(/databases/$(database)/documents/clients/$(clientId)).data.ownerUid &&
-              incoming().clientEmail == get(/databases/$(database)/documents/clients/$(clientId)).data.email
-            )
+            isStaffOrManager() ||
+            isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data)
           );
 
         allow update: if false;
-        allow delete: if isVerifiedUser() && isValidId(clientId) && isValidId(verificationId) && isAdmin();
+        allow delete: if isAdmin();
       }
 
-      // -----------------------------------------------------------------------
       // Subcollection: /clients/{clientId}/reminders/{reminderId}
-      // -----------------------------------------------------------------------
       match /reminders/{reminderId} {
         allow get: if isVerifiedUser() &&
           isValidId(clientId) &&
           isValidId(reminderId) &&
           (
-            isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data) ||
-            isAdmin()
+            isStaffOrManager() ||
+            isClientOwner(get(/databases/$(database)/documents/clients/$(clientId)).data)
           );
 
-        allow list: if isBootstrappedAdmin() || (
+        allow list: if isStaffOrManager() || (
           isVerifiedUser() &&
           (existing().clientOwnerUid == request.auth.uid || existing().clientEmail == request.auth.token.email)
         );
@@ -293,15 +232,11 @@ service cloud.firestore {
         allow create: if isVerifiedUser() &&
           isValidId(clientId) &&
           isValidId(reminderId) &&
-          isValidReminderDoc(incoming()) &&
-          incoming().clientId == clientId &&
-          incoming().sentByUid == request.auth.uid &&
-          incoming().createdAt == request.time &&
           exists(/databases/$(database)/documents/clients/$(clientId)) &&
-          isAdmin();
+          isStaffOrManager();
 
         allow update: if false;
-        allow delete: if isVerifiedUser() && isValidId(clientId) && isValidId(reminderId) && isAdmin();
+        allow delete: if isAdmin();
       }
     }
   }

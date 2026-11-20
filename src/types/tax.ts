@@ -1,5 +1,16 @@
 import type { Timestamp } from 'firebase/firestore';
 
+export type UserRole = 'administrator' | 'manager' | 'user';
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: UserRole;
+  assignedClientId?: string | null;
+  createdAt: Timestamp | null;
+}
+
 export type JobStatus = 'No Book In' | 'Pending Document' | 'Book In Can Start';
 
 export type DocumentStatus = 'Verified' | 'Missing' | 'Invalid';
@@ -40,6 +51,11 @@ export interface TaxClient {
   reminderCount: number;
   lastReminderSent: Timestamp | null;
   latestReminderDraft: string;
+  assignedTo?: {
+    uid: string;
+    name: string;
+    email: string;
+  } | null;
   requiredDocuments: RequiredDocumentItem[];
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;

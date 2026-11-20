@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { Send, RefreshCw, ArrowUpRight, CheckCircle2, Clock, AlertCircle } from 'lucide-react';
 import type { ReminderChannel, ReminderStage, TaxClient } from '../types/tax';
 import { determineWorkflowStage, dispatchReminder, draftReminderApi } from '../lib/taxService';
+import { logActivity } from '../lib/auditService';
 import { JobStatusText } from './StatusIndicator';
 
 interface ReminderQueueViewProps {
@@ -82,6 +83,11 @@ export function ReminderQueueView({
     setStatusNotice(null);
     try {
       await dispatchReminder(client, wf.stage, channel, msg);
+      void logActivity({
+        pageVisited: 'Follow-Up Queue',
+        actionTaken: 'DISPATCH_REMINDER',
+        details: `Dispatched "${wf.stage}" reminder via ${channel} to ${client.name} (${client.clientId}, ${client.email}).`,
+      });
       setStatusNotice(`Dispatched ${wf.stage} via ${channel} to ${client.name} (${client.clientId}).`);
     } catch (err) {
       setStatusNotice(err instanceof Error ? err.message : 'Failed to dispatch reminder.');
@@ -95,13 +101,22 @@ export function ReminderQueueView({
     setBatchRunning(true);
     setStatusNotice(null);
     let sent = 0;
+    const dispatchedIds: string[] = [];
     try {
       for (const item of actionableOverdue) {
         const msg = draftOverrides[item.client.clientId] || item.client.latestReminderDraft;
         if (msg.trim()) {
           await dispatchReminder(item.client, item.workflow.stage, channel, msg);
           sent += 1;
+          dispatchedIds.push(item.client.clientId);
         }
+      }
+      if (sent > 0) {
+        void logActivity({
+          pageVisited: 'Follow-Up Queue',
+          actionTaken: 'DISPATCH_REMINDER',
+          details: `Batch dispatched ${sent} ${channel} follow-up reminder${sent === 1 ? '' : 's'} for clients: ${dispatchedIds.join(', ')}.`,
+        });
       }
       setStatusNotice(
         `Batch workflow complete: dispatched ${sent} itemized ${channel} follow-up${sent === 1 ? '' : 's'}.`

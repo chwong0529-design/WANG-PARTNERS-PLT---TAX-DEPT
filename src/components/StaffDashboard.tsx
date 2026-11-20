@@ -6,14 +6,18 @@ import {
   FolderOpen,
   ArrowUpRight,
   Lock,
+  UserCheck,
 } from 'lucide-react';
-import type { JobStatus, TaxClient } from '../types/tax';
-import { determineWorkflowStage } from '../lib/taxService';
+import type { JobStatus, TaxClient, UserProfile, UserRole } from '../types/tax';
+import { assignClientToStaff, determineWorkflowStage } from '../lib/taxService';
+import { logActivity } from '../lib/auditService';
 import { JobStatusText } from './StatusIndicator';
 
 interface StaffDashboardProps {
   clients: TaxClient[];
   loading: boolean;
+  userRole: UserRole;
+  staffProfiles: UserProfile[];
   onSelectClient: (clientId: string) => void;
   onOpenNewClient: () => void;
   onGoToReminders: (clientId?: string) => void;
@@ -24,6 +28,8 @@ type StatusFilter = 'All' | JobStatus;
 export function StaffDashboard({
   clients,
   loading,
+  userRole,
+  staffProfiles,
   onSelectClient,
   onOpenNewClient,
   onGoToReminders,
@@ -31,6 +37,7 @@ export function StaffDashboard({
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const [yearFilter, setYearFilter] = useState<string>('All');
+  const [assigningId, setAssigningId] = useState<string | null>(null);
 
   const years = useMemo(() => {
     const unique = Array.from(new Set(clients.map((c) => c.taxYear))).sort((a, b) => b - a);
@@ -56,10 +63,45 @@ export function StaffDashboard({
         c.clientId.toLowerCase().includes(q) ||
         c.name.toLowerCase().includes(q) ||
         c.email.toLowerCase().includes(q) ||
-        c.filingCategory.toLowerCase().includes(q)
+        c.filingCategory.toLowerCase().includes(q) ||
+        (c.assignedTo?.name || '').toLowerCase().includes(q)
       );
     });
   }, [clients, searchQuery, statusFilter, yearFilter]);
+
+  const handleStaffAssignment = async (clientId: string, staffUid: string) => {
+    setAssigningId(clientId);
+    const targetClient = clients.find((c) => c.clientId === clientId);
+    const previousAssignee = targetClient?.assignedTo?.email || 'Unassigned';
+    try {
+      if (!staffUid) {
+        await assignClientToStaff(clientId, null);
+        void logActivity({
+          pageVisited: 'Staff Dashboard',
+          actionTaken: 'ASSIGN_DUTY',
+          details: `Unassigned client ${clientId} (${targetClient?.name || 'Unknown'}) — previously assigned to ${previousAssignee}.`,
+        });
+      } else {
+        const found = staffProfiles.find((p) => p.uid === staffUid);
+        if (found) {
+          await assignClientToStaff(clientId, {
+            uid: found.uid,
+            name: found.displayName,
+            email: found.email,
+          });
+          void logActivity({
+            pageVisited: 'Staff Dashboard',
+            actionTaken: 'ASSIGN_DUTY',
+            details: `Assigned client ${clientId} (${targetClient?.name || 'Unknown'}) to ${found.displayName} (${found.email}, ${found.role}) — previously ${previousAssignee}.`,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to assign staff:', err);
+    } finally {
+      setAssigningId(null);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -120,7 +162,7 @@ export function StaffDashboard({
                 type="search"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search ID, taxpayer, or email..."
+                placeholder="Search ID, taxpayer, staff..."
                 className="w-full pl-9 pr-3 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700"
               />
             </div>
@@ -240,7 +282,7 @@ export function StaffDashboard({
                   <th className="py-3 pl-5 pr-4 whitespace-nowrap">Reference ID</th>
                   <th className="py-3 px-4 whitespace-nowrap">Taxpayer</th>
                   <th className="py-3 px-4 whitespace-nowrap">Category · YA</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Checklist</th>
+                  <th className="py-3 px-4 whitespace-nowrap">Assigned Staff</th>
                   <th className="py-3 px-4 whitespace-nowrap">Job Status</th>
                   <th className="py-3 px-4 whitespace-nowrap">Follow-Up State</th>
                   <th className="py-3 pl-4 pr-5 text-right whitespace-nowrap">Actions</th>
@@ -248,12 +290,10 @@ export function StaffDashboard({
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
                 {filteredClients.map((client) => {
-                  const totalDocs = client.requiredDocuments.length;
-                  const verifiedDocs = client.requiredDocuments.filter(
-                    (d) => d.status === 'Verified'
-                  ).length;
-                  const pct = totalDocs > 0 ? Math.round((verifiedDocs / totalDocs) * 100) : 0;
                   const workflow = determineWorkflowStage(client);
+                  const activeStaffList = staffProfiles.filter(
+                    (p) => p.role === 'administrator' || p.role === 'manager'
+                  );
 
                   return (
                     <tr
@@ -279,12 +319,6 @@ export function StaffDashboard({
                         </div>
                         <div className="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5">
                           <span>{client.email}</span>
-                          {client.phone && (
-                            <>
-                              <span aria-hidden="true">·</span>
-                              <span className="font-mono tabular-nums">{client.phone}</span>
-                            </>
-                          )}
                         </div>
                       </td>
 
@@ -294,24 +328,24 @@ export function StaffDashboard({
                         <span className="font-mono tabular-nums">YA {client.taxYear}</span>
                       </td>
 
-                      <td className="py-3.5 px-4 whitespace-nowrap">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-20 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                            <div
-                              className={`h-full transition-all ${
-                                pct === 100
-                                  ? 'bg-emerald-600'
-                                  : pct > 0
-                                    ? 'bg-amber-500'
-                                    : 'bg-slate-300'
-                              }`}
-                              style={{ width: `${pct}%` }}
-                            />
-                          </div>
-                          <span className="font-mono text-xs text-slate-700 tabular-nums">
-                            {verifiedDocs}/{totalDocs}
-                          </span>
-                        </div>
+                      <td
+                        className="py-3.5 px-4 whitespace-nowrap"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <select
+                          value={client.assignedTo?.uid || ''}
+                          disabled={assigningId === client.clientId}
+                          onChange={(e) => handleStaffAssignment(client.clientId, e.target.value)}
+                          aria-label="Assign duty to staff"
+                          className="px-2.5 py-1 text-xs font-medium bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-700 cursor-pointer"
+                        >
+                          <option value="">Unassigned</option>
+                          {activeStaffList.map((st) => (
+                            <option key={st.uid} value={st.uid}>
+                              {st.displayName} ({st.role})
+                            </option>
+                          ))}
+                        </select>
                       </td>
 
                       <td className="py-3.5 px-4 whitespace-nowrap">

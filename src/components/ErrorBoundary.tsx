@@ -1,5 +1,7 @@
 import React from 'react';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
+import { signOut } from 'firebase/auth';
+import { auth } from '../lib/firebase';
 
 interface State {
   hasError: boolean;
@@ -56,14 +58,30 @@ export class ErrorBoundary extends React.Component<
                 Free-tier daily Firestore quotas reset the following day. You can review quota details under the Spark plan Enterprise edition section in Firebase pricing.
               </p>
             )}
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              <RotateCcw className="w-4 h-4" />
-              Reload Application
-            </button>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-4 h-4" />
+                <span>Reload Application</span>
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await signOut(auth);
+                    window.location.reload();
+                  } catch {
+                    window.location.reload();
+                  }
+                }}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer"
+              >
+                <span>Sign Out</span>
+              </button>
+            </div>
           </div>
         </div>
       );

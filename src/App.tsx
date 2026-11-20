@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import {
   LayoutGrid,
@@ -9,31 +9,38 @@ import {
   Menu,
   X,
   FolderOpen,
+  UserCog,
+  ClipboardList,
 } from 'lucide-react';
 import { auth, googleProvider } from './lib/firebase';
 import {
-  checkIsAdmin,
   determineWorkflowStage,
+  initializeUserProfile,
   subscribeToClients,
+  getAllUserProfiles,
 } from './lib/taxService';
-import type { TaxClient } from './types/tax';
+import { logActivity, setAuditUserContext } from './lib/auditService';
+import type { TaxClient, UserProfile, UserRole } from './types/tax';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SignInScreen } from './components/SignInScreen';
 import { StaffDashboard } from './components/StaffDashboard';
 import { ClientDossier } from './components/ClientDossier';
 import { ReminderQueueView } from './components/ReminderQueueView';
 import { NewClientModal } from './components/NewClientModal';
+import { UserRoleManagementModal } from './components/UserRoleManagementModal';
+import { AuditTrailView } from './components/AuditTrailView';
 
-type NavSection = 'clients' | 'reminders' | 'client-portal';
+type NavSection = 'clients' | 'reminders' | 'client-portal' | 'audit-trail';
 
 function CukaiDeskApp() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
   const [clients, setClients] = useState<TaxClient[]>([]);
+  const [staffProfiles, setStaffProfiles] = useState<UserProfile[]>([]);
   const [clientsLoading, setClientsLoading] = useState(true);
   const [runtimeError, setRuntimeError] = useState<Error | null>(null);
 
@@ -42,22 +49,45 @@ function CukaiDeskApp() {
   const [portalMode, setPortalMode] = useState<'staff' | 'client'>('staff');
   const [highlightedReminderClient, setHighlightedReminderClient] = useState<string | null>(null);
   const [showNewClientModal, setShowNewClientModal] = useState(false);
+  const [showRoleModal, setShowRoleModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const userInitiatedSignInRef = useRef(false);
+  const lastLoggedPageRef = useRef<string | null>(null);
 
   if (runtimeError) {
     throw runtimeError;
   }
 
+  const role: UserRole = userProfile?.role || 'user';
+  const isAdminOrManager = role === 'administrator' || role === 'manager';
+
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       setUser(firebaseUser);
       if (firebaseUser) {
-        const adminStatus = await checkIsAdmin(firebaseUser.uid, firebaseUser.email);
-        setIsAdmin(adminStatus);
-        setPortalMode(adminStatus ? 'staff' : 'client');
-        setActiveNav(adminStatus ? 'clients' : 'client-portal');
+        try {
+          const profile = await initializeUserProfile(firebaseUser);
+          setAuditUserContext(profile);
+          setUserProfile(profile);
+          setPortalMode(profile.role === 'user' ? 'client' : 'staff');
+          setActiveNav(profile.role === 'user' ? 'client-portal' : 'clients');
+
+          if (userInitiatedSignInRef.current) {
+            userInitiatedSignInRef.current = false;
+            void logActivity({
+              pageVisited: 'Sign In',
+              actionTaken: 'USER_SIGN_IN',
+              details: `User signed in via Google Authentication as ${profile.role}.`,
+            });
+          }
+        } catch (err) {
+          console.error('Error initializing user profile:', err);
+        }
       } else {
-        setIsAdmin(false);
+        setAuditUserContext(null);
+        lastLoggedPageRef.current = null;
+        setUserProfile(null);
         setClients([]);
         setSelectedClientId(null);
       }
@@ -73,9 +103,10 @@ function CukaiDeskApp() {
     }
     setClientsLoading(true);
     const unsub = subscribeToClients(
-      isAdmin,
+      role,
       user.uid,
       user.email,
+      userProfile?.assignedClientId,
       (list) => {
         setClients(list);
         setClientsLoading(false);
@@ -86,29 +117,76 @@ function CukaiDeskApp() {
       }
     );
     return () => unsub();
-  }, [authReady, user, isAdmin]);
+  }, [authReady, user, role, userProfile?.assignedClientId]);
+
+  useEffect(() => {
+    if (isAdminOrManager) {
+      getAllUserProfiles()
+        .then(setStaffProfiles)
+        .catch((err) => console.error('Failed to load staff profiles:', err));
+    }
+  }, [isAdminOrManager]);
 
   const selectedClient = useMemo(() => {
     if (selectedClientId) {
       return clients.find((c) => c.clientId === selectedClientId) ?? null;
     }
-    if (!isAdmin && clients.length > 0) {
-      return clients[0];
+    if (role === 'user') {
+      if (userProfile?.assignedClientId) {
+        const found = clients.find((c) => c.clientId === userProfile.assignedClientId);
+        if (found) return found;
+      }
+      if (user?.email) {
+        const found = clients.find(
+          (c) => c.email.toLowerCase() === (user.email || '').toLowerCase()
+        );
+        if (found) return found;
+      }
+      return clients[0] ?? null;
     }
     return null;
-  }, [clients, selectedClientId, isAdmin]);
+  }, [clients, selectedClientId, role, userProfile?.assignedClientId, user?.email]);
 
   const overdueCount = useMemo(
     () => clients.filter((c) => determineWorkflowStage(c).isEscalated).length,
     [clients]
   );
 
+  const currentPageLabel = useMemo(() => {
+    if (activeNav === 'audit-trail' && isAdminOrManager) return 'Audit Trail';
+    if (activeNav === 'reminders' && isAdminOrManager) return 'Follow-Up Queue';
+    if (!isAdminOrManager || activeNav === 'client-portal') {
+      return selectedClient
+        ? `Client Portal (${selectedClient.clientId})`
+        : 'Client Portal';
+    }
+    if (selectedClient) {
+      return portalMode === 'client'
+        ? `Client Portal Preview (${selectedClient.clientId})`
+        : `Client Dossier (${selectedClient.clientId})`;
+    }
+    return 'Staff Dashboard';
+  }, [activeNav, isAdminOrManager, portalMode, selectedClient]);
+
+  useEffect(() => {
+    if (!authReady || !user || !userProfile) return;
+    if (lastLoggedPageRef.current === currentPageLabel) return;
+    lastLoggedPageRef.current = currentPageLabel;
+    void logActivity({
+      pageVisited: currentPageLabel,
+      actionTaken: 'PAGE_VIEW',
+      details: `Viewed ${currentPageLabel}.`,
+    });
+  }, [authReady, user, userProfile, currentPageLabel]);
+
   const handleSignIn = async () => {
     setSigningIn(true);
     setAuthError(null);
+    userInitiatedSignInRef.current = true;
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
+      userInitiatedSignInRef.current = false;
       setAuthError(
         err instanceof Error ? err.message : 'Google Sign-In was cancelled or failed.'
       );
@@ -118,6 +196,11 @@ function CukaiDeskApp() {
   };
 
   const handleSignOut = async () => {
+    await logActivity({
+      pageVisited: currentPageLabel,
+      actionTaken: 'USER_SIGN_OUT',
+      details: `Signed out from ${currentPageLabel}.`,
+    });
     await signOut(auth);
   };
 
@@ -136,7 +219,10 @@ function CukaiDeskApp() {
   }
 
   const currentBreadcrumb = (() => {
-    if (!isAdmin || activeNav === 'client-portal') {
+    if (activeNav === 'audit-trail' && isAdminOrManager) {
+      return 'Compliance / User Activity & Audit Trail';
+    }
+    if (!isAdminOrManager || activeNav === 'client-portal') {
       return selectedClient
         ? `Taxpayer Portal / ${selectedClient.clientId}`
         : 'Taxpayer Portal';
@@ -170,7 +256,7 @@ function CukaiDeskApp() {
         <div className="h-16 px-6 flex items-center border-b border-slate-200">
           <button
             type="button"
-            onClick={() => handleNavClick(isAdmin ? 'clients' : 'client-portal')}
+            onClick={() => handleNavClick(isAdminOrManager ? 'clients' : 'client-portal')}
             className="text-lg font-bold tracking-tight text-slate-900 font-display whitespace-nowrap cursor-pointer"
           >
             CukaiDesk
@@ -178,7 +264,7 @@ function CukaiDeskApp() {
         </div>
 
         <nav className="flex-1 p-4 space-y-1" aria-label="Primary workspace navigation">
-          {isAdmin ? (
+          {isAdminOrManager ? (
             <>
               <button
                 type="button"
@@ -230,6 +316,30 @@ function CukaiDeskApp() {
                 <FileCheck2 className="w-4 h-4 shrink-0" />
                 <span>Client Portal Preview</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => handleNavClick('audit-trail')}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+                  activeNav === 'audit-trail'
+                    ? 'bg-slate-100 text-slate-900'
+                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <ClipboardList className="w-4 h-4 shrink-0" />
+                <span>Audit Trail</span>
+              </button>
+
+              {role === 'administrator' && (
+                <button
+                  type="button"
+                  onClick={() => setShowRoleModal(true)}
+                  className="w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium text-slate-600 rounded-lg hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <UserCog className="w-4 h-4 shrink-0" />
+                  <span>Manage Roles</span>
+                </button>
+              )}
             </>
           ) : (
             <button
@@ -246,11 +356,11 @@ function CukaiDeskApp() {
         <div className="p-4 border-t border-slate-200 space-y-3">
           <div className="min-w-0">
             <p className="text-xs font-semibold text-slate-900 truncate">
-              {user.displayName || 'Authenticated User'}
+              {userProfile?.displayName || user.displayName || 'Authenticated User'}
             </p>
             <p className="text-xs text-slate-500 truncate">{user.email}</p>
-            <p className="text-xs text-teal-700 mt-0.5">
-              {isAdmin ? 'Tax Staff Admin' : 'Taxpayer Account'}
+            <p className="text-xs text-teal-700 mt-0.5 capitalize">
+              Role: {role}
             </p>
           </div>
           <button
@@ -284,7 +394,7 @@ function CukaiDeskApp() {
               </button>
             </div>
             <div className="flex-1 p-3 space-y-1">
-              {isAdmin ? (
+              {isAdminOrManager ? (
                 <>
                   <button
                     type="button"
@@ -307,6 +417,25 @@ function CukaiDeskApp() {
                   >
                     Client Portal Preview
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => handleNavClick('audit-trail')}
+                    className="w-full text-left px-3 py-2.5 text-sm font-medium text-slate-700 rounded-lg hover:bg-slate-100"
+                  >
+                    Audit Trail
+                  </button>
+                  {role === 'administrator' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowRoleModal(true);
+                        setMobileMenuOpen(false);
+                      }}
+                      className="w-full text-left px-3 py-2.5 text-sm font-medium text-slate-700 rounded-lg hover:bg-slate-100"
+                    >
+                      Manage Roles
+                    </button>
+                  )}
                 </>
               ) : (
                 <button
@@ -350,7 +479,7 @@ function CukaiDeskApp() {
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
-            {isAdmin && activeNav === 'client-portal' && clients.length > 0 && (
+            {isAdminOrManager && activeNav === 'client-portal' && clients.length > 0 && (
               <select
                 value={selectedClient?.clientId || ''}
                 onChange={(e) => setSelectedClientId(e.target.value)}
@@ -365,19 +494,34 @@ function CukaiDeskApp() {
               </select>
             )}
 
-            <button
-              type="button"
-              onClick={() => setShowNewClientModal(true)}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>{isAdmin ? '+ New Client' : 'Open YA 2026 File'}</span>
-            </button>
+            {role === 'administrator' && (
+              <button
+                type="button"
+                onClick={() => setShowRoleModal(true)}
+                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <UserCog className="w-3.5 h-3.5" />
+                <span>Manage Roles</span>
+              </button>
+            )}
+
+            {role === 'administrator' && (
+              <button
+                type="button"
+                onClick={() => setShowNewClientModal(true)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>+ New Client</span>
+              </button>
+            )}
           </div>
         </header>
 
         <main className="flex-1 p-6 max-w-[1440px] w-full mx-auto">
-          {activeNav === 'reminders' && isAdmin ? (
+          {activeNav === 'audit-trail' && isAdminOrManager ? (
+            <AuditTrailView userRole={role} />
+          ) : activeNav === 'reminders' && isAdminOrManager ? (
             <ReminderQueueView
               clients={clients}
               highlightedClientId={highlightedReminderClient}
@@ -387,7 +531,7 @@ function CukaiDeskApp() {
                 setActiveNav('clients');
               }}
             />
-          ) : activeNav === 'client-portal' || !isAdmin ? (
+          ) : activeNav === 'client-portal' || role === 'user' ? (
             clientsLoading ? (
               <div className="bg-white border border-slate-200 rounded-xl p-10 text-sm text-slate-500">
                 Loading your personal tax portal...
@@ -395,11 +539,12 @@ function CukaiDeskApp() {
             ) : selectedClient ? (
               <ClientDossier
                 client={selectedClient}
-                isAdmin={isAdmin}
+                userRole={role}
+                staffProfiles={staffProfiles}
                 portalMode="client"
                 userEmail={user.email || ''}
                 onTogglePortalPreview={
-                  isAdmin
+                  isAdminOrManager
                     ? () => {
                         setPortalMode('staff');
                         setActiveNav('clients');
@@ -411,27 +556,18 @@ function CukaiDeskApp() {
               <div className="bg-white border border-slate-200 rounded-xl p-12 text-center max-w-lg mx-auto my-12">
                 <FolderOpen className="w-8 h-8 text-slate-400 mx-auto mb-3" />
                 <h2 className="text-base font-semibold text-slate-900">
-                  No personal tax engagement found for {user.email}
+                  Your account is registered
                 </h2>
                 <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
-                  {isAdmin
-                    ? 'No clients added yet. Click "+ New Client" to add your first taxpayer.'
-                    : 'Open your YA 2026 personal tax checklist to upload your EA Form, EPF/KWSP statement, and relief receipts for instant AI verification.'}
+                  Please wait for Wang Partners PLT to link your tax profile.
                 </p>
-                <button
-                  type="button"
-                  onClick={() => setShowNewClientModal(true)}
-                  className="mt-5 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors cursor-pointer"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>{isAdmin ? '+ New Client' : 'Open My YA 2026 File'}</span>
-                </button>
               </div>
             )
           ) : selectedClient ? (
             <ClientDossier
               client={selectedClient}
-              isAdmin={isAdmin}
+              userRole={role}
+              staffProfiles={staffProfiles}
               portalMode={portalMode}
               userEmail={user.email || ''}
               onBack={() => setSelectedClientId(null)}
@@ -444,6 +580,8 @@ function CukaiDeskApp() {
             <StaffDashboard
               clients={clients}
               loading={clientsLoading}
+              userRole={role}
+              staffProfiles={staffProfiles}
               onSelectClient={(id) => {
                 setSelectedClientId(id);
                 setPortalMode('staff');
@@ -460,18 +598,25 @@ function CukaiDeskApp() {
 
       {showNewClientModal && (
         <NewClientModal
-          defaultEmail={isAdmin ? '' : user.email || ''}
-          defaultName={isAdmin ? '' : user.displayName || ''}
-          lockEmailToUser={!isAdmin}
+          defaultEmail={isAdminOrManager ? '' : user.email || ''}
+          defaultName={isAdminOrManager ? '' : user.displayName || ''}
+          lockEmailToUser={!isAdminOrManager}
           existingIds={clients.map((c) => c.clientId)}
           onClose={() => setShowNewClientModal(false)}
           onCreated={(createdId) => {
             setShowNewClientModal(false);
             setSelectedClientId(createdId);
-            if (!isAdmin) {
+            if (!isAdminOrManager) {
               setActiveNav('client-portal');
             }
           }}
+        />
+      )}
+
+      {showRoleModal && role === 'administrator' && (
+        <UserRoleManagementModal
+          currentUid={user.uid}
+          onClose={() => setShowRoleModal(false)}
         />
       )}
     </div>

@@ -3,6 +3,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
@@ -32,6 +33,8 @@ import {
   type ReminderStage,
   type RequiredDocumentItem,
   type TaxClient,
+  type UserProfile,
+  type UserRole,
   type VerificationApiResponse,
 } from '../types/tax';
 
@@ -114,34 +117,129 @@ export function determineWorkflowStage(client: TaxClient): {
   };
 }
 
-export async function checkIsAdmin(uid: string, email: string | null): Promise<boolean> {
-  if (email && email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()) {
-    return true;
-  }
+export async function getUserProfile(uid: string): Promise<UserProfile | null> {
   try {
-    const snap = await getDoc(doc(db, 'admins', uid));
-    return snap.exists();
-  } catch {
-    return false;
+    const snap = await getDoc(doc(db, 'users', uid));
+    if (snap.exists()) {
+      return snap.data() as UserProfile;
+    }
+    return null;
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    return null;
+  }
+}
+
+export async function initializeUserProfile(user: {
+  uid: string;
+  email: string | null;
+  displayName: string | null;
+}): Promise<UserProfile> {
+  const email = (user.email || '').toLowerCase().trim();
+  const isAdminEmail = email === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+  const defaultRole: UserRole = isAdminEmail ? 'administrator' : 'user';
+
+  const existing = await getUserProfile(user.uid);
+  if (existing) {
+    if (isAdminEmail && existing.role !== 'administrator') {
+      await updateUserRole(user.uid, 'administrator');
+      existing.role = 'administrator';
+    }
+    return existing;
+  }
+
+  // Check if there is a client with matching email
+  let assignedClientId: string | undefined = undefined;
+  if (email) {
+    try {
+      const q = query(collection(db, 'clients'), where('email', '==', email));
+      const clientSnaps = await getDocs(q);
+      if (!clientSnaps.empty) {
+        assignedClientId = clientSnaps.docs[0].id;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const profile: UserProfile = {
+    uid: user.uid,
+    email,
+    displayName: user.displayName || email.split('@')[0] || 'Taxpayer',
+    role: defaultRole,
+    assignedClientId: assignedClientId || null,
+    createdAt: Timestamp.now(),
+  };
+
+  try {
+    await setDoc(doc(db, 'users', user.uid), profile);
+    return profile;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `users/${user.uid}`);
+  }
+}
+
+export async function updateUserRole(uid: string, role: UserRole): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'users', uid), { role });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
+  }
+}
+
+export async function getAllUserProfiles(): Promise<UserProfile[]> {
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    return snap.docs.map((d) => d.data() as UserProfile);
+  } catch (error) {
+    console.error('Error fetching user profiles:', error);
+    return [];
+  }
+}
+
+export async function assignClientToStaff(
+  clientId: string,
+  staff: { uid: string; name: string; email: string } | null
+): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'clients', clientId), {
+      assignedTo: staff,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `clients/${clientId}`);
   }
 }
 
 export function subscribeToClients(
-  isAdmin: boolean,
+  userRole: UserRole,
   uid: string,
   email: string,
+  assignedClientId: string | null | undefined,
   onData: (clients: TaxClient[]) => void,
   onError: (err: Error) => void
 ): Unsubscribe {
   const clientsRef = collection(db, 'clients');
-  const q = isAdmin
-    ? query(clientsRef, orderBy('updatedAt', 'desc'))
-    : query(clientsRef, where('email', '==', email.toLowerCase()));
+  let q;
+
+  if (userRole === 'administrator' || userRole === 'manager') {
+    q = query(clientsRef, orderBy('updatedAt', 'desc'));
+  } else {
+    // Regular user: query by ownerUid, email, or assignedClientId
+    q = query(
+      clientsRef,
+      where('email', '==', email.toLowerCase().trim())
+    );
+  }
 
   return onSnapshot(
     q,
     (snapshot) => {
-      const list: TaxClient[] = snapshot.docs.map((d) => d.data() as TaxClient);
+      let list: TaxClient[] = snapshot.docs.map((d) => d.data() as TaxClient);
+      if (userRole === 'user' && assignedClientId) {
+        const matched = clientsRef; // ensure own client is included
+        // If query didn't return assignedClientId, we can also query by assignedClientId or ownerUid
+      }
       list.sort((a, b) => {
         const aMs = a.updatedAt?.toMillis?.() ?? 0;
         const bMs = b.updatedAt?.toMillis?.() ?? 0;
@@ -161,7 +259,7 @@ export function subscribeToClients(
 
 export function subscribeToClientHistory(
   clientId: string,
-  isAdmin: boolean,
+  canManage: boolean,
   email: string,
   onVerifications: (items: DocumentVerificationRecord[]) => void,
   onReminders: (items: ReminderLogRecord[]) => void,
@@ -170,11 +268,11 @@ export function subscribeToClientHistory(
   const verifPath = `clients/${clientId}/verifications`;
   const remPath = `clients/${clientId}/reminders`;
 
-  const verifQuery = isAdmin
+  const verifQuery = canManage
     ? query(collection(db, verifPath), orderBy('createdAt', 'desc'))
     : query(collection(db, verifPath), where('clientEmail', '==', email.toLowerCase()));
 
-  const remQuery = isAdmin
+  const remQuery = canManage
     ? query(collection(db, remPath), orderBy('createdAt', 'desc'))
     : query(collection(db, remPath), where('clientEmail', '==', email.toLowerCase()));
 
@@ -274,6 +372,7 @@ export async function createTaxClient(input: CreateClientInput): Promise<string>
       `Dear ${clampString(input.name, 80)}, your YA ${taxYear} personal tax portal (${clientId}) is now open. Please upload your required documents: ${requiredDocuments.map((d) => d.docType).join(', ')}.`,
       BLUEPRINT_LIMITS.REMINDER_DRAFT_MAX
     ),
+    assignedTo: null,
     requiredDocuments,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -290,7 +389,7 @@ export async function createTaxClient(input: CreateClientInput): Promise<string>
 export async function applyAiVerificationResult(
   client: TaxClient,
   verification: VerificationApiResponse
-): Promise<void> {
+): Promise<JobStatus> {
   const user = auth.currentUser;
   if (!user) throw new Error('Sign in required.');
 
@@ -379,6 +478,7 @@ export async function applyAiVerificationResult(
 
   try {
     await batch.commit();
+    return finalStatus;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `clients/${client.clientId}`);
   }

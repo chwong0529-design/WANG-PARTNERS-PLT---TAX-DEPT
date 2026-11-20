@@ -7,6 +7,7 @@ import {
   type FilingCategory,
 } from '../types/tax';
 import { createTaxClient, sanitizeClientId } from '../lib/taxService';
+import { logActivity } from '../lib/auditService';
 
 interface NewClientModalProps {
   defaultEmail?: string;
@@ -88,6 +89,11 @@ export function NewClientModal({
         taxYear,
         filingCategory,
         docTypes,
+      });
+      void logActivity({
+        pageVisited: 'New Client Modal',
+        actionTaken: 'CREATE_CLIENT',
+        details: `Created client ${createdId} (${name.trim()}, ${email.trim().toLowerCase()}, ${filingCategory}, YA ${taxYear}) with ${docTypes.length} required document${docTypes.length === 1 ? '' : 's'}.`,
       });
       onCreated(createdId);
     } catch (err) {
