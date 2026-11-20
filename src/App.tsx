@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import {
   LayoutGrid,
@@ -12,7 +12,7 @@ import {
   UserCog,
   ClipboardList,
 } from 'lucide-react';
-import { auth, googleProvider } from './lib/firebase';
+import { auth, googleProvider, unsubscribeAllFirestoreListeners } from './lib/firebase';
 import {
   determineWorkflowStage,
   initializeUserProfile,
@@ -20,6 +20,11 @@ import {
   getAllUserProfiles,
 } from './lib/taxService';
 import { logActivity, setAuditUserContext } from './lib/auditService';
+import {
+  clearStoredActivity,
+  useIdleLogout,
+  writeStoredActivity,
+} from './hooks/useIdleLogout';
 import type { TaxClient, UserProfile, UserRole } from './types/tax';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SignInScreen } from './components/SignInScreen';
@@ -29,6 +34,7 @@ import { ReminderQueueView } from './components/ReminderQueueView';
 import { NewClientModal } from './components/NewClientModal';
 import { UserRoleManagementModal } from './components/UserRoleManagementModal';
 import { AuditTrailView } from './components/AuditTrailView';
+import { IdleWarningModal } from './components/IdleWarningModal';
 
 type NavSection = 'clients' | 'reminders' | 'client-portal' | 'audit-trail';
 
@@ -51,9 +57,12 @@ function CukaiDeskApp() {
   const [showNewClientModal, setShowNewClientModal] = useState(false);
   const [showRoleModal, setShowRoleModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [idleNotice, setIdleNotice] = useState<string | null>(null);
+  const [isSigningOut, setIsSigningOut] = useState(false);
 
   const userInitiatedSignInRef = useRef(false);
   const lastLoggedPageRef = useRef<string | null>(null);
+  const signingOutRef = useRef(false);
 
   if (runtimeError) {
     throw runtimeError;
@@ -66,6 +75,7 @@ function CukaiDeskApp() {
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       setUser(firebaseUser);
       if (firebaseUser) {
+        setIdleNotice(null);
         try {
           const profile = await initializeUserProfile(firebaseUser);
           setAuditUserContext(profile);
@@ -75,6 +85,7 @@ function CukaiDeskApp() {
 
           if (userInitiatedSignInRef.current) {
             userInitiatedSignInRef.current = false;
+            writeStoredActivity(Date.now());
             void logActivity({
               pageVisited: 'Sign In',
               actionTaken: 'USER_SIGN_IN',
@@ -85,6 +96,7 @@ function CukaiDeskApp() {
           console.error('Error initializing user profile:', err);
         }
       } else {
+        unsubscribeAllFirestoreListeners();
         setAuditUserContext(null);
         lastLoggedPageRef.current = null;
         setUserProfile(null);
@@ -97,7 +109,7 @@ function CukaiDeskApp() {
   }, []);
 
   useEffect(() => {
-    if (!authReady || !user || !user.email) {
+    if (!authReady || !user || !user.email || isSigningOut) {
       setClientsLoading(false);
       return;
     }
@@ -112,12 +124,13 @@ function CukaiDeskApp() {
         setClientsLoading(false);
       },
       (err) => {
+        if (signingOutRef.current) return;
         setClientsLoading(false);
         setRuntimeError(err);
       }
     );
     return () => unsub();
-  }, [authReady, user, role, userProfile?.assignedClientId]);
+  }, [authReady, user, role, userProfile?.assignedClientId, isSigningOut]);
 
   useEffect(() => {
     if (isAdminOrManager) {
@@ -179,12 +192,67 @@ function CukaiDeskApp() {
     });
   }, [authReady, user, userProfile, currentPageLabel]);
 
+  const performSafeSignOut = useCallback(
+    async (reason: 'manual' | 'idle') => {
+      if (signingOutRef.current) return;
+      signingOutRef.current = true;
+      setIsSigningOut(true);
+
+      try {
+        if (reason === 'idle') {
+          await logActivity({
+            pageVisited: currentPageLabel,
+            actionTaken: 'AUTO_LOGOUT_IDLE',
+            details: 'Automatically signed out after 10 minutes of inactivity',
+          });
+        } else {
+          await logActivity({
+            pageVisited: currentPageLabel,
+            actionTaken: 'USER_SIGN_OUT',
+            details: `Signed out from ${currentPageLabel}.`,
+          });
+        }
+
+        // Detach ALL active Firestore onSnapshot listeners BEFORE signOut(auth)
+        unsubscribeAllFirestoreListeners();
+        clearStoredActivity();
+
+        if (reason === 'idle') {
+          setIdleNotice('You were signed out automatically after 10 minutes of inactivity.');
+        } else {
+          setIdleNotice(null);
+        }
+
+        await signOut(auth);
+      } finally {
+        signingOutRef.current = false;
+        setIsSigningOut(false);
+      }
+    },
+    [currentPageLabel]
+  );
+
+  const handleIdleTimeout = useCallback(() => {
+    return performSafeSignOut('idle');
+  }, [performSafeSignOut]);
+
+  const {
+    showWarning: showIdleWarning,
+    secondsRemaining: idleSecondsRemaining,
+    staySignedIn,
+  } = useIdleLogout({
+    enabled: Boolean(user) && !isSigningOut,
+    onIdleTimeout: handleIdleTimeout,
+  });
+
   const handleSignIn = async () => {
     setSigningIn(true);
     setAuthError(null);
+    setIdleNotice(null);
     userInitiatedSignInRef.current = true;
     try {
       await signInWithPopup(auth, googleProvider);
+      writeStoredActivity(Date.now());
     } catch (err) {
       userInitiatedSignInRef.current = false;
       setAuthError(
@@ -196,12 +264,7 @@ function CukaiDeskApp() {
   };
 
   const handleSignOut = async () => {
-    await logActivity({
-      pageVisited: currentPageLabel,
-      actionTaken: 'USER_SIGN_OUT',
-      details: `Signed out from ${currentPageLabel}.`,
-    });
-    await signOut(auth);
+    await performSafeSignOut('manual');
   };
 
   if (!authReady) {
@@ -214,7 +277,12 @@ function CukaiDeskApp() {
 
   if (!user) {
     return (
-      <SignInScreen onSignIn={handleSignIn} signingIn={signingIn} error={authError} />
+      <SignInScreen
+        onSignIn={handleSignIn}
+        signingIn={signingIn}
+        error={authError}
+        notice={idleNotice}
+      />
     );
   }
 
@@ -619,6 +687,13 @@ function CukaiDeskApp() {
           onClose={() => setShowRoleModal(false)}
         />
       )}
+
+      <IdleWarningModal
+        showWarning={showIdleWarning}
+        secondsRemaining={idleSecondsRemaining}
+        onStaySignedIn={staySignedIn}
+        onSignOutNow={handleSignOut}
+      />
     </div>
   );
 }

@@ -17,6 +17,7 @@ import {
   db,
   handleFirestoreError,
   OperationType,
+  trackFirestoreListener,
 } from './firebase';
 import type { UserProfile, UserRole } from '../types/tax';
 
@@ -134,7 +135,7 @@ export function subscribeToAuditLogs(
     limit(maxEntries)
   );
 
-  return onSnapshot(
+  const unsub = onSnapshot(
     q,
     (snapshot) => {
       const rows: AuditLogEntry[] = snapshot.docs.map((docSnap) => ({
@@ -151,6 +152,8 @@ export function subscribeToAuditLogs(
       }
     }
   );
+
+  return trackFirestoreListener(unsub);
 }
 
 const mytDateTimeFormatter = new Intl.DateTimeFormat('en-GB', {

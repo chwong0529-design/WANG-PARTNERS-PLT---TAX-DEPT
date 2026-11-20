@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import multer from 'multer';
 import { GoogleGenAI, Type } from '@google/genai';
 
 dotenv.config();
@@ -10,49 +11,138 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3.8-flash';
+const MAX_UPLOAD_BYTES = 15 * 1024 * 1024; // 15MB
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+const ALLOWED_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+
+const DOCUMENT_CATEGORY_ENUM = [
+  'EA Form / Employment Income',
+  'EPF / KWSP Statement',
+  'CP58 Commission Statement',
+  'Medical Receipt',
+  'Lifestyle / Tech Receipt',
+  'Insurance / Takaful Statement',
+  'Zakat / Approved Donation Receipt',
+  'Dividend / Bank Interest Voucher',
+  'Unrecognized / Blurry',
+] as const;
+
+// Strictly server-side Gemini SDK initialization
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  },
+});
+
+function assertGeminiKey(): void {
+  if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
 }
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,
+    files: 1,
+  },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error(
+          `Unsupported file type (${file.mimetype}). Please upload a PDF, JPEG, PNG, or WebP document.`
+        )
+      );
+    }
+  },
+});
+
+const ANALYZE_DOCUMENT_SYSTEM_INSTRUCTION = `You are a Malaysian Personal Income Tax (LHDN) Document & Receipt Reader for a chartered accounting firm.
+Your task is to inspect a single uploaded PDF or image (receipt, EA Form, EPF/KWSP statement, CP58 commission voucher, medical bill, lifestyle/tech receipt, insurance/takaful statement, zakat/donation receipt, or dividend/bank interest voucher) and extract structured tax data accurately.
+
+Strict Rules:
+1. Classify documentCategory strictly into one of the allowed enum values:
+   - "EA Form / Employment Income"
+   - "EPF / KWSP Statement"
+   - "CP58 Commission Statement"
+   - "Medical Receipt"
+   - "Lifestyle / Tech Receipt"
+   - "Insurance / Takaful Statement"
+   - "Zakat / Approved Donation Receipt"
+   - "Dividend / Bank Interest Voucher"
+   - "Unrecognized / Blurry"
+2. Set isLegible to false if the image is blurry, cropped, cut off, dark, low-resolution, or unreadable so amounts/dates/issuer cannot be verified reliably. Otherwise set isLegible to true.
+3. Extract merchantOrIssuer (employer name, hospital/clinic, insurer, takaful operator, zakat center, bank, or retail vendor). Use "" if unreadable.
+4. Extract receiptDate in strict YYYY-MM-DD format (or "" if no date is found).
+5. Extract taxYear as an integer Year of Assessment (e.g., 2026) detected on the document (or 0 if no year is found).
+6. Set taxYearMatches to true ONLY if the detected taxYear equals the client's active Year of Assessment provided in the prompt. Otherwise set taxYearMatches to false.
+7. Extract totalAmountMYR as a numeric total in Malaysian Ringgit (MYR) — e.g., gross annual remuneration/total paid/total contribution/receipt grand total. Use 0 if no monetary amount is shown.
+8. Map taxReliefCategory to the applicable LHDN Malaysia personal tax relief or income category (e.g., "Income", "EPF & Life Insurance", "Medical Expenses", "Lifestyle", "Education & Medical Insurance", "Zakat", "Approved Donation", "Investment Income", or "Not Applicable").
+9. Provide concise confidenceNotes explaining what was extracted or why the document needs manual review (e.g., blurry text, wrong tax year, missing total).
+10. Match the document against the client's requiredDocuments checklist array and set matchedChecklistItem to the EXACT matching string from requiredDocuments, or "" if none of the checklist items apply.
+
+Return ONLY valid JSON conforming strictly to the responseSchema.`;
 
 const TAX_VERIFICATION_SYSTEM_INSTRUCTION = `You are an expert Personal Tax Document Verification Assistant for a Malaysian accounting firm (LHDN personal income tax).
 Your job is to inspect uploaded client tax documents (images or PDFs), identify what type of tax document each file is, verify its tax year, and compare the uploaded files against the client's Required Document Checklist.
 
 Rules:
-1. Classify each uploaded document accurately against Malaysia personal tax categories (e.g., EA Form / Employment Income, EPF / KWSP Statement, Medical & Lifestyle Receipts, Zakat / Donation Receipt, Insurance Statement, Bank Interest / Dividend Statement, CP58 Commission Statement, PCB / Monthly Tax Deduction Statement, or Unrecognized).
+1. Classify each uploaded document accurately against Malaysia personal tax categories.
 2. Extract key metadata: Taxpayer Name, Tax Year, and Total Amount in MYR (if applicable).
 3. Compare verified documents (both newly uploaded valid documents AND already-verified items noted in the checklist) against the provided requiredDocuments list.
 4. Match each uploaded file to the closest item in the client's requiredDocuments list when applicable, and put the exact matched checklist docType string into matchedChecklistDocType (or empty string if none matches).
-5. Determine the exact recommendedJobStatus based on these strict rules:
-   - "No Book In": 0 required documents have been verified/uploaded.
-   - "Pending Document": At least 1 required document is verified/uploaded, but 1 or more required documents are still missing, wrong tax year, or unreadable.
-   - "Book In Can Start": All required documents are present, legible, and match the requested tax year.
-6. Draft a polite, clear reminder message listing ONLY the specific missing documents if the status is "Pending Document", a general booking-in reminder if "No Book In", or a warm confirmation that all documents are complete and handed over to our tax preparer if "Book In Can Start".
+5. Determine the exact recommendedJobStatus: "No Book In", "Pending Document", or "Book In Can Start".
+6. Draft a polite, clear reminder message listing ONLY the specific missing documents if needed.
 
 Output strictly in the requested JSON schema.`;
 
 interface UploadedFilePayload {
   fileName: string;
   mimeType: string;
-  data: string; // base64 without data URL prefix
+  data: string;
 }
 
 interface ChecklistItemInput {
   docType: string;
   status: string;
   fileName?: string | null;
+}
+
+function parseRequiredDocumentsField(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) =>
+        typeof item === 'string'
+          ? item.trim()
+          : item && typeof item === 'object' && 'docType' in item
+            ? String((item as { docType: unknown }).docType).trim()
+            : ''
+      )
+      .filter(Boolean);
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      return parseRequiredDocumentsField(parsed);
+    } catch {
+      return raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
 }
 
 async function startServer() {
@@ -65,11 +155,172 @@ async function startServer() {
   });
 
   /**
+   * POST /api/analyze-document
+   * Accepts multipart/form-data (via multer memory storage, max 15MB) or JSON base64 payload.
+   * Analyzes a single receipt or tax document using Gemini 3.8 Flash with a strict JSON schema.
+   */
+  app.post('/api/analyze-document', (req, res, next) => {
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('multipart/form-data')) {
+      upload.single('file')(req, res, (err: unknown) => {
+        if (err) {
+          if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+            return res
+              .status(400)
+              .json({ error: 'Uploaded file exceeds the 15MB maximum size limit.' });
+          }
+          const msg = err instanceof Error ? err.message : 'File upload failed.';
+          return res.status(400).json({ error: msg });
+        }
+        return next();
+      });
+    } else {
+      return next();
+    }
+  }, async (req, res) => {
+    try {
+      assertGeminiKey();
+
+      const body = req.body as Record<string, unknown>;
+      const clientId = String(body.clientId || '').trim();
+      const taxYear = Number(body.taxYear) || new Date().getFullYear();
+      const requiredDocuments = parseRequiredDocumentsField(body.requiredDocuments);
+
+      let base64Data = '';
+      let mimeType = '';
+      let fileName = '';
+
+      if (req.file) {
+        base64Data = req.file.buffer.toString('base64');
+        mimeType = req.file.mimetype;
+        fileName = req.file.originalname || 'uploaded-document';
+      } else if (typeof body.fileBase64 === 'string' && body.fileBase64.trim()) {
+        const rawBase64 = body.fileBase64.trim();
+        base64Data = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
+        mimeType = String(body.mimeType || '').trim();
+        fileName = String(body.fileName || 'uploaded-document').trim();
+
+        const estimatedBytes = Math.ceil((base64Data.length * 3) / 4);
+        if (estimatedBytes > MAX_UPLOAD_BYTES) {
+          return res
+            .status(400)
+            .json({ error: 'Uploaded file exceeds the 15MB maximum size limit.' });
+        }
+      } else {
+        return res
+          .status(400)
+          .json({ error: 'No document file provided. Please upload a PDF, JPEG, PNG, or WebP file.' });
+      }
+
+      if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+        return res.status(400).json({
+          error: `Unsupported file type (${mimeType || 'unknown'}). Allowed types: PDF, JPEG, PNG, WebP.`,
+        });
+      }
+
+      const promptText = `Analyze the attached Malaysian personal tax document or receipt.
+Client Reference ID: ${clientId || 'N/A'}
+Active Year of Assessment (YA): ${taxYear}
+Original File Name: ${fileName}
+Client Required Document Checklist:
+${JSON.stringify(requiredDocuments, null, 2)}
+
+Extract all required fields strictly according to the schema. Set taxYearMatches to true only when the document's Year of Assessment matches ${taxYear}. Set matchedChecklistItem to the exact string from the checklist above that this file satisfies, or "" if none matches.`;
+
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                data: base64Data,
+                mimeType,
+              },
+            },
+            {
+              text: promptText,
+            },
+          ],
+        },
+        config: {
+          systemInstruction: ANALYZE_DOCUMENT_SYSTEM_INSTRUCTION,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              documentCategory: {
+                type: Type.STRING,
+                enum: [...DOCUMENT_CATEGORY_ENUM],
+              },
+              isLegible: {
+                type: Type.BOOLEAN,
+              },
+              merchantOrIssuer: {
+                type: Type.STRING,
+              },
+              receiptDate: {
+                type: Type.STRING,
+              },
+              taxYear: {
+                type: Type.INTEGER,
+              },
+              taxYearMatches: {
+                type: Type.BOOLEAN,
+              },
+              totalAmountMYR: {
+                type: Type.NUMBER,
+              },
+              taxReliefCategory: {
+                type: Type.STRING,
+              },
+              confidenceNotes: {
+                type: Type.STRING,
+              },
+              matchedChecklistItem: {
+                type: Type.STRING,
+              },
+            },
+            required: [
+              'documentCategory',
+              'isLegible',
+              'merchantOrIssuer',
+              'receiptDate',
+              'taxYear',
+              'taxYearMatches',
+              'totalAmountMYR',
+              'taxReliefCategory',
+              'confidenceNotes',
+              'matchedChecklistItem',
+            ],
+          },
+        },
+      });
+
+      const rawText = response.text;
+      if (!rawText) {
+        return res.status(502).json({ error: 'Gemini returned an empty document analysis response.' });
+      }
+
+      const parsed = JSON.parse(rawText);
+      return res.json({
+        fileName,
+        ...parsed,
+      });
+    } catch (error) {
+      console.error('Error analyzing document with Gemini:', error);
+      const message = error instanceof Error ? error.message : 'Document analysis failed.';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  /**
    * POST /api/verify-documents
-   * Runs multimodal Gemini 2.5 Flash verification against uploaded PDFs / images.
+   * Batch multimodal verification endpoint retained for backwards compatibility.
    */
   app.post('/api/verify-documents', async (req, res) => {
     try {
+      assertGeminiKey();
+
       const {
         clientName,
         clientId,
@@ -96,8 +347,6 @@ async function startServer() {
         return res.status(400).json({ error: 'A maximum of 10 files can be verified per batch.' });
       }
 
-      const ai = getGeminiClient();
-
       const parts: Array<
         { text: string } | { inlineData: { mimeType: string; data: string } }
       > = [
@@ -110,9 +359,7 @@ Current Required Document Checklist (items already marked "Verified" should rema
 ${JSON.stringify(requiredDocuments, null, 2)}
 
 Uploaded files in order:
-${files.map((f, idx) => `${idx + 1}. ${f.fileName} (${f.mimeType})`).join('\n')}
-
-Inspect every attached document carefully. Verify whether the tax year matches YA ${taxYear ?? 2026}, extract MYR monetary totals where shown, map each valid file to the exact docType in the checklist if applicable, identify all still-missing docTypes from the checklist, determine recommendedJobStatus, and write automatedReminderDraft.`,
+${files.map((f, idx) => `${idx + 1}. ${f.fileName} (${f.mimeType})`).join('\n')}`,
         },
       ];
 
@@ -192,10 +439,12 @@ Inspect every attached document carefully. Verify whether the tax year matches Y
 
   /**
    * POST /api/draft-reminder
-   * Generates polished Malaysia personal tax Email + WhatsApp follow-up drafts via Gemini 2.5 Flash.
+   * Generates polished Malaysia personal tax Email + WhatsApp follow-up drafts via Gemini.
    */
   app.post('/api/draft-reminder', async (req, res) => {
     try {
+      assertGeminiKey();
+
       const {
         clientName,
         clientId,
@@ -215,8 +464,6 @@ Inspect every attached document carefully. Verify whether the tax year matches Y
         stage?: string;
         daysSinceLastReminder?: number | null;
       };
-
-      const ai = getGeminiClient();
 
       const prompt = `Draft a concise, courteous, professional Malaysian personal tax client communication for:
 - Client Name: ${clientName ?? 'Valued Client'}

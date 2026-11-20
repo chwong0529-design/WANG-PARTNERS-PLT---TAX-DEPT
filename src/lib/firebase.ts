@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import { doc, getDocFromServer, getFirestore, type Unsubscribe } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 export const BOOTSTRAPPED_ADMIN_EMAIL = 'chwong0529@gmail.com';
@@ -12,6 +12,35 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+const activeFirestoreListeners = new Set<Unsubscribe>();
+
+export function trackFirestoreListener(unsubscribe: Unsubscribe): Unsubscribe {
+  const safeUnsub: Unsubscribe = () => {
+    if (activeFirestoreListeners.has(safeUnsub)) {
+      activeFirestoreListeners.delete(safeUnsub);
+      try {
+        unsubscribe();
+      } catch {
+        // Ignore already-detached listener errors
+      }
+    }
+  };
+  activeFirestoreListeners.add(safeUnsub);
+  return safeUnsub;
+}
+
+export function unsubscribeAllFirestoreListeners(): void {
+  const listeners = Array.from(activeFirestoreListeners);
+  activeFirestoreListeners.clear();
+  for (const unsub of listeners) {
+    try {
+      unsub();
+    } catch {
+      // Ignore teardown errors
+    }
+  }
+}
 
 export enum OperationType {
   CREATE = 'create',

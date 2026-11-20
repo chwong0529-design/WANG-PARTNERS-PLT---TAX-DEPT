@@ -35,6 +35,14 @@ export function DocumentStatusText({ status }: { status: DocumentStatus }) {
       </span>
     );
   }
+  if (status === 'Needs Review') {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0 text-amber-600" aria-hidden="true" />
+        <span>Needs Review</span>
+      </span>
+    );
+  }
   if (status === 'Invalid') {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">

@@ -21,9 +21,11 @@ import {
   db,
   handleFirestoreError,
   OperationType,
+  trackFirestoreListener,
 } from './firebase';
 import {
   BLUEPRINT_LIMITS,
+  type AnalyzeDocumentResult,
   type DocumentVerificationRecord,
   type FilingCategory,
   type JobStatus,
@@ -60,7 +62,11 @@ export function computeJobStatusFromChecklist(
   if (docs.length === 0) return 'No Book In';
   const verifiedCount = docs.filter((d) => d.status === 'Verified').length;
   const uploadedCount = docs.filter(
-    (d) => d.status === 'Verified' || d.status === 'Invalid' || Boolean(d.fileName)
+    (d) =>
+      d.status === 'Verified' ||
+      d.status === 'Needs Review' ||
+      d.status === 'Invalid' ||
+      Boolean(d.fileName)
   ).length;
   if (uploadedCount === 0) return 'No Book In';
   if (verifiedCount === docs.length) return 'Book In Can Start';
@@ -232,14 +238,10 @@ export function subscribeToClients(
     );
   }
 
-  return onSnapshot(
+  const unsub = onSnapshot(
     q,
     (snapshot) => {
-      let list: TaxClient[] = snapshot.docs.map((d) => d.data() as TaxClient);
-      if (userRole === 'user' && assignedClientId) {
-        const matched = clientsRef; // ensure own client is included
-        // If query didn't return assignedClientId, we can also query by assignedClientId or ownerUid
-      }
+      const list: TaxClient[] = snapshot.docs.map((d) => d.data() as TaxClient);
       list.sort((a, b) => {
         const aMs = a.updatedAt?.toMillis?.() ?? 0;
         const bMs = b.updatedAt?.toMillis?.() ?? 0;
@@ -255,6 +257,8 @@ export function subscribeToClients(
       }
     }
   );
+
+  return trackFirestoreListener(unsub);
 }
 
 export function subscribeToClientHistory(
@@ -314,10 +318,10 @@ export function subscribeToClientHistory(
     }
   );
 
-  return () => {
+  return trackFirestoreListener(() => {
     unsubVerif();
     unsubRem();
-  };
+  });
 }
 
 export interface CreateClientInput {
@@ -484,6 +488,142 @@ export async function applyAiVerificationResult(
   }
 }
 
+function matchesChecklistDocType(
+  itemDocType: string,
+  analysis: AnalyzeDocumentResult
+): boolean {
+  const target = itemDocType.toLowerCase().trim();
+  const matchedItem = (analysis.matchedChecklistItem || '').toLowerCase().trim();
+  if (matchedItem && matchedItem === target) {
+    return true;
+  }
+  const cat = (analysis.documentCategory || '').toLowerCase().trim();
+  if (!cat || cat === 'unrecognized / blurry') return false;
+  if (cat === target) return true;
+  if (target.includes('ea form') && (cat.includes('ea form') || cat.includes('employment'))) return true;
+  if (target.includes('epf') && (cat.includes('epf') || cat.includes('kwsp'))) return true;
+  if (target.includes('cp58') && cat.includes('cp58')) return true;
+  if (target.includes('medical') && (cat.includes('medical') || cat.includes('lifestyle'))) return true;
+  if (target.includes('lifestyle') && cat.includes('lifestyle')) return true;
+  if (target.includes('zakat') && (cat.includes('zakat') || cat.includes('donation'))) return true;
+  if (target.includes('dividend') && (cat.includes('dividend') || cat.includes('interest'))) return true;
+  if (target.includes('insurance') && (cat.includes('insurance') || cat.includes('takaful'))) return true;
+  if (target.includes('pcb') && cat.includes('pcb')) return true;
+  return false;
+}
+
+export async function applyAnalyzedDocumentsResult(
+  client: TaxClient,
+  analyses: AnalyzeDocumentResult[]
+): Promise<{
+  finalStatus: JobStatus;
+  missingDocuments: string[];
+  matchedCount: number;
+}> {
+  const user = auth.currentUser;
+  if (!user) throw new Error('Sign in required.');
+
+  let matchedCount = 0;
+
+  const updatedChecklist: RequiredDocumentItem[] = client.requiredDocuments.map((item) => {
+    const matched = analyses.find((a) => matchesChecklistDocType(item.docType, a));
+    if (!matched) {
+      return item;
+    }
+
+    matchedCount += 1;
+    const isVerified = matched.isLegible === true && matched.taxYearMatches === true;
+    const nextStatus = isVerified ? 'Verified' : 'Needs Review';
+
+    return {
+      docType: item.docType,
+      status: nextStatus,
+      fileName: clampString(matched.fileName || 'uploaded-document', 140),
+      fileUrl: `portal://${client.clientId}/${clampString(matched.fileName || 'document', 100)}`,
+      extractedAmount:
+        typeof matched.totalAmountMYR === 'number' && !Number.isNaN(matched.totalAmountMYR)
+          ? matched.totalAmountMYR
+          : null,
+      taxYearValid: Boolean(matched.taxYearMatches),
+      notes: clampString(
+        matched.confidenceNotes ||
+          (isVerified
+            ? `Verified by Gemini (${matched.documentCategory}).`
+            : 'Flagged for review — check legibility or Year of Assessment.'),
+        320
+      ),
+      documentCategory: clampString(matched.documentCategory || '', 100) || null,
+      isLegible: Boolean(matched.isLegible),
+      merchantOrIssuer: clampString(matched.merchantOrIssuer || '', 140) || null,
+      receiptDate: clampString(matched.receiptDate || '', 32) || null,
+      detectedTaxYear:
+        typeof matched.taxYear === 'number' && matched.taxYear > 0
+          ? Math.round(matched.taxYear)
+          : null,
+      taxReliefCategory: clampString(matched.taxReliefCategory || '', 100) || null,
+    };
+  });
+
+  const missingDocuments = updatedChecklist
+    .filter((d) => d.status !== 'Verified')
+    .map((d) => d.docType);
+
+  const finalStatus = computeJobStatusFromChecklist(updatedChecklist);
+
+  const nextDraft =
+    finalStatus === 'Book In Can Start'
+      ? `Dear ${client.name}, all required documents for YA ${client.taxYear} (${client.clientId}) have been verified. Your tax file is now marked Book In Can Start and queued for LHDN computation.`
+      : finalStatus === 'Pending Document'
+        ? `Dear ${client.name}, thank you for uploading your YA ${client.taxYear} tax document(s) (${client.clientId}). We are still awaiting verified copies of: ${missingDocuments.join(', ')}.`
+        : `Dear ${client.name}, your YA ${client.taxYear} personal tax portal (${client.clientId}) is open. Please upload your required documents: ${missingDocuments.join(', ')}.`;
+
+  const verificationId = `ver_${Date.now()}`;
+  const batch = writeBatch(db);
+
+  batch.update(doc(db, 'clients', client.clientId), {
+    requiredDocuments: updatedChecklist.slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS),
+    jobStatus: finalStatus,
+    latestReminderDraft: clampString(nextDraft, BLUEPRINT_LIMITS.REMINDER_DRAFT_MAX),
+    updatedAt: serverTimestamp(),
+  });
+
+  batch.set(doc(db, `clients/${client.clientId}/verifications`, verificationId), {
+    clientId: client.clientId,
+    clientOwnerUid: client.ownerUid,
+    clientEmail: client.email,
+    submittedByUid: user.uid,
+    recommendedJobStatus: finalStatus,
+    automatedReminderDraft: clampString(nextDraft, BLUEPRINT_LIMITS.REMINDER_DRAFT_MAX),
+    detectedDocuments: analyses.slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS).map((a) => ({
+      fileName: clampString(a.fileName || 'uploaded-document', 140),
+      documentCategory: clampString(a.documentCategory || 'Unrecognized / Blurry', 100),
+      matchedChecklistDocType: clampString(a.matchedChecklistItem || '', 120),
+      merchantOrIssuer: clampString(a.merchantOrIssuer || '', 140),
+      receiptDate: clampString(a.receiptDate || '', 32),
+      taxYear: typeof a.taxYear === 'number' ? Math.round(a.taxYear) : 0,
+      taxYearValid: Boolean(a.taxYearMatches),
+      isLegible: Boolean(a.isLegible),
+      extractedAmount:
+        typeof a.totalAmountMYR === 'number' && !Number.isNaN(a.totalAmountMYR)
+          ? a.totalAmountMYR
+          : 0,
+      taxReliefCategory: clampString(a.taxReliefCategory || '', 100),
+      notes: clampString(a.confidenceNotes || '', 320),
+    })),
+    missingDocuments: missingDocuments
+      .map((m) => clampString(m, 160))
+      .slice(0, BLUEPRINT_LIMITS.MAX_REQUIRED_DOCUMENTS),
+    createdAt: serverTimestamp(),
+  });
+
+  try {
+    await batch.commit();
+    return { finalStatus, missingDocuments, matchedCount };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `clients/${client.clientId}`);
+  }
+}
+
 export async function updateClientChecklistItem(
   client: TaxClient,
   index: number,
@@ -612,6 +752,34 @@ export async function fileToBase64(file: File): Promise<string> {
     reader.onerror = () => reject(new Error(`Failed to read file ${file.name}`));
     reader.readAsDataURL(file);
   });
+}
+
+export async function analyzeTaxDocumentApi(
+  client: TaxClient,
+  file: File
+): Promise<AnalyzeDocumentResult> {
+  const formData = new FormData();
+  formData.append('clientId', client.clientId);
+  formData.append('taxYear', String(client.taxYear));
+  formData.append(
+    'requiredDocuments',
+    JSON.stringify(client.requiredDocuments.map((d) => d.docType))
+  );
+  formData.append('file', file, file.name);
+
+  const response = await fetch('/api/analyze-document', {
+    method: 'POST',
+    body: formData,
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || `Failed to analyze ${file.name} with Gemini.`);
+  }
+  return {
+    ...(data as AnalyzeDocumentResult),
+    fileName: (data as Partial<AnalyzeDocumentResult>).fileName || file.name,
+  };
 }
 
 export async function verifyTaxDocumentsApi(

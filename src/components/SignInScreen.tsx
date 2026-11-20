@@ -1,12 +1,13 @@
-import { FileCheck2, ShieldCheck, ArrowRight, BellRing, FolderKanban } from 'lucide-react';
+import { FileCheck2, ShieldCheck, ArrowRight, BellRing, FolderKanban, Clock } from 'lucide-react';
 
 interface SignInScreenProps {
   onSignIn: () => void;
   signingIn: boolean;
   error: string | null;
+  notice?: string | null;
 }
 
-export function SignInScreen({ onSignIn, signingIn, error }: SignInScreenProps) {
+export function SignInScreen({ onSignIn, signingIn, error, notice }: SignInScreenProps) {
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <header className="w-full bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between gap-8">
@@ -28,6 +29,16 @@ export function SignInScreen({ onSignIn, signingIn, error }: SignInScreenProps) 
 
       <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-16 grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
         <div className="lg:col-span-7 space-y-6">
+          {notice && (
+            <div
+              role="status"
+              className="p-3.5 bg-slate-100 border border-slate-300 rounded-lg text-sm text-slate-800 max-w-xl flex items-start gap-2.5"
+            >
+              <Clock className="w-4 h-4 text-slate-600 shrink-0 mt-0.5" aria-hidden="true" />
+              <span>{notice}</span>
+            </div>
+          )}
+
           <p className="text-xs font-medium tracking-wide text-teal-700">
             Personal Tax Operations · Malaysia LHDN Compliance
           </p>
@@ -35,7 +46,7 @@ export function SignInScreen({ onSignIn, signingIn, error }: SignInScreenProps) 
             Collect, verify, and book in personal tax documents automatically.
           </h1>
           <p className="text-base text-slate-600 leading-relaxed max-w-xl">
-            CukaiDesk pairs a taxpayer upload portal with Gemini 2.5 Flash multimodal document classification. Inspect EA Forms, EPF/KWSP statements, CP58 vouchers, and medical receipts the moment clients upload them—and trigger itemized missing-document follow-ups without manual chasing.
+            CukaiDesk pairs a taxpayer upload portal with Gemini 3.8 Flash multimodal document classification. Inspect EA Forms, EPF/KWSP statements, CP58 vouchers, and medical receipts the moment clients upload them—and trigger itemized missing-document follow-ups without manual chasing.
           </p>
 
           <div className="pt-2 flex flex-wrap items-center gap-4">

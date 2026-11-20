@@ -3,9 +3,7 @@ import {
   ArrowLeft,
   Upload,
   FileText,
-  Sparkles,
   Check,
-  X,
   Lock,
   Unlock,
   Trash2,
@@ -25,17 +23,19 @@ import {
   ALL_STANDARD_DOC_TYPES,
   BLUEPRINT_LIMITS,
   MALAYSIA_DOC_GUIDANCE,
+  type AnalyzeDocumentResult,
   type DocumentStatus,
   type DocumentVerificationRecord,
+  type JobStatus,
   type ReminderChannel,
   type ReminderLogRecord,
   type TaxClient,
   type UserProfile,
   type UserRole,
-  type VerificationApiResponse,
 } from '../types/tax';
 import {
-  applyAiVerificationResult,
+  analyzeTaxDocumentApi,
+  applyAnalyzedDocumentsResult,
   assignClientToStaff,
   computeJobStatusFromChecklist,
   deleteTaxClient,
@@ -46,7 +46,6 @@ import {
   toggleClientLock,
   updateClientChecklistItem,
   updateClientChecklistStructure,
-  verifyTaxDocumentsApi,
 } from '../lib/taxService';
 import { logActivity } from '../lib/auditService';
 import { DocumentStatusText, formatMyr, JobStatusText } from './StatusIndicator';
@@ -75,11 +74,19 @@ export function ClientDossier({
   const isStaffView = (userRole === 'administrator' || userRole === 'manager') && portalMode === 'staff';
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [verifying, setVerifying] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzingProgress, setAnalyzingProgress] = useState<{
+    currentFile: string;
+    index: number;
+    total: number;
+  } | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
-  const [lastAiResult, setLastAiResult] = useState<VerificationApiResponse | null>(null);
+  const [latestAnalysisSummary, setLatestAnalysisSummary] = useState<{
+    results: AnalyzeDocumentResult[];
+    finalStatus: JobStatus;
+    missingDocuments: string[];
+  } | null>(null);
 
   const [verifications, setVerifications] = useState<DocumentVerificationRecord[]>([]);
   const [reminders, setReminders] = useState<ReminderLogRecord[]>([]);
@@ -125,72 +132,117 @@ export function ClientDossier({
     return () => unsub();
   }, [client.clientId, userRole, userEmail]);
 
-  const handleFilesSelected = (incoming: FileList | File[]) => {
-    const accepted = Array.from(incoming).filter(
-      (f) =>
-        f.type.startsWith('image/') ||
-        f.type === 'application/pdf' ||
-        /\.(pdf|png|jpe?g|webp)$/i.test(f.name)
-    );
-    if (accepted.length === 0) {
-      setVerifyError('Please select PDF, PNG, JPG, or WebP tax documents.');
-      return;
-    }
-    setVerifyError(null);
-    setStagedFiles((prev) => [...prev, ...accepted].slice(0, 10));
-  };
-
   const pageLabel =
     portalMode === 'client'
       ? `Client Portal (${client.clientId})`
       : `Client Dossier (${client.clientId})`;
 
-  const handleRunVerification = async () => {
-    if (stagedFiles.length === 0) return;
+  const analyzeUploadedFiles = async (filesToAnalyze: File[]) => {
+    if (filesToAnalyze.length === 0) return;
     if (client.isLocked && !isStaffView) {
       setVerifyError('This tax file has been locked by your tax preparer for LHDN computation.');
       return;
     }
-    setVerifying(true);
-    setVerifyError(null);
-    const fileNames = stagedFiles.map((f) => f.name);
-    const previousStatus = client.jobStatus;
 
-    void logActivity({
-      pageVisited: pageLabel,
-      actionTaken: 'UPLOAD_TAX_DOCUMENT',
-      details: `Uploaded ${fileNames.length} tax document${fileNames.length === 1 ? '' : 's'} for ${client.clientId} (${client.name}): ${fileNames.join(', ')}.`,
-    });
+    setAnalyzing(true);
+    setVerifyError(null);
+    const previousStatus = client.jobStatus;
+    const completedResults: AnalyzeDocumentResult[] = [];
+    const failedMessages: string[] = [];
 
     try {
-      const result = await verifyTaxDocumentsApi(client, stagedFiles);
-      setLastAiResult(result);
-      const finalStatus = await applyAiVerificationResult(client, result);
-      setStagedFiles([]);
+      for (let i = 0; i < filesToAnalyze.length; i += 1) {
+        const file = filesToAnalyze[i];
+        setAnalyzingProgress({
+          currentFile: file.name,
+          index: i + 1,
+          total: filesToAnalyze.length,
+        });
 
-      const missingSummary =
-        result.missingDocuments.length === 0
-          ? '0 missing documents'
-          : `${result.missingDocuments.length} missing (${result.missingDocuments.join(', ')})`;
+        try {
+          const analysis = await analyzeTaxDocumentApi(client, file);
+          completedResults.push(analysis);
 
-      void logActivity({
-        pageVisited: pageLabel,
-        actionTaken: 'AI_DOCUMENT_VERIFICATION',
-        details: `Gemini AI verified ${result.detectedDocuments.length} document${result.detectedDocuments.length === 1 ? '' : 's'} for ${client.clientId}: ${missingSummary}. Recommended status: "${result.recommendedJobStatus}".`,
-      });
+          const outcome =
+            analysis.isLegible && analysis.taxYearMatches ? 'Verified' : 'Needs Review';
 
-      if (finalStatus !== previousStatus) {
+          void logActivity({
+            pageVisited: pageLabel,
+            actionTaken: 'UPLOAD_TAX_DOCUMENT',
+            details: `Uploaded "${analysis.fileName}" for ${client.clientId} (${client.name}) — Category: ${analysis.documentCategory}, Issuer: ${analysis.merchantOrIssuer || 'Unknown'}, Amount: ${formatMyr(analysis.totalAmountMYR)}, Relief: ${analysis.taxReliefCategory || 'N/A'}, YA ${analysis.taxYear || 'Unknown'} (${outcome}).`,
+          });
+        } catch (fileErr) {
+          failedMessages.push(
+            `${file.name}: ${fileErr instanceof Error ? fileErr.message : 'Analysis failed.'}`
+          );
+        }
+      }
+
+      if (completedResults.length > 0) {
+        const { finalStatus, missingDocuments } = await applyAnalyzedDocumentsResult(
+          client,
+          completedResults
+        );
+
+        setLatestAnalysisSummary({
+          results: completedResults,
+          finalStatus,
+          missingDocuments,
+        });
+
+        const missingSummary =
+          missingDocuments.length === 0
+            ? '0 missing documents'
+            : `${missingDocuments.length} missing (${missingDocuments.join(', ')})`;
+
         void logActivity({
           pageVisited: pageLabel,
-          actionTaken: 'JOB_STATUS_CHANGE',
-          details: `Client ${client.clientId} (${client.name}) job status changed from "${previousStatus}" to "${finalStatus}" after AI document verification.`,
+          actionTaken: 'AI_DOCUMENT_VERIFICATION',
+          details: `Gemini analyzed ${completedResults.length} document${completedResults.length === 1 ? '' : 's'} for ${client.clientId}: ${missingSummary}. Computed job status: "${finalStatus}".`,
         });
+
+        if (finalStatus !== previousStatus) {
+          void logActivity({
+            pageVisited: pageLabel,
+            actionTaken: 'JOB_STATUS_CHANGE',
+            details: `Client ${client.clientId} (${client.name}) job status changed from "${previousStatus}" to "${finalStatus}" after Gemini document analysis.`,
+          });
+        }
+      }
+
+      if (failedMessages.length > 0) {
+        setVerifyError(failedMessages.join(' | '));
       }
     } catch (err) {
-      setVerifyError(err instanceof Error ? err.message : 'Document verification failed.');
+      setVerifyError(err instanceof Error ? err.message : 'Document analysis failed.');
     } finally {
-      setVerifying(false);
+      setAnalyzing(false);
+      setAnalyzingProgress(null);
     }
+  };
+
+  const handleFilesSelected = (incoming: FileList | File[]) => {
+    const MAX_BYTES = 15 * 1024 * 1024;
+    const rawList = Array.from(incoming).slice(0, 10);
+    const validTypeFiles = rawList.filter(
+      (f) =>
+        f.type === 'application/pdf' ||
+        f.type === 'image/jpeg' ||
+        f.type === 'image/png' ||
+        f.type === 'image/webp' ||
+        /\.(pdf|png|jpe?g|webp)$/i.test(f.name)
+    );
+    if (validTypeFiles.length === 0) {
+      setVerifyError('Please upload PDF, JPEG, PNG, or WebP receipts and tax documents.');
+      return;
+    }
+    const oversized = validTypeFiles.find((f) => f.size > MAX_BYTES);
+    if (oversized) {
+      setVerifyError(`"${oversized.name}" exceeds the 15MB maximum file size.`);
+      return;
+    }
+    setVerifyError(null);
+    void analyzeUploadedFiles(validTypeFiles);
   };
 
   const handleManualStatusChange = async (idx: number, status: DocumentStatus) => {
@@ -546,7 +598,7 @@ export function ClientDossier({
         {portalMode === 'client' && userRole !== 'user' && (
           <div className="mt-4 pt-3 border-t border-slate-200 text-xs text-teal-800 flex items-center justify-between gap-4">
             <span>
-              Viewing the simplified taxpayer upload portal for {client.name}. Uploads here run live Gemini 2.5 Flash verification and update Firestore immediately.
+              Viewing the simplified taxpayer upload portal for {client.name}. Uploads here run live Gemini 3.8 Flash document extraction and update Firestore immediately.
             </span>
           </div>
         )}
@@ -577,38 +629,88 @@ export function ClientDossier({
             <div className="divide-y divide-slate-100">
               {client.requiredDocuments.map((docItem, idx) => {
                 const guidance = MALAYSIA_DOC_GUIDANCE[docItem.docType];
+                const hasExtractedMeta = Boolean(
+                  docItem.documentCategory ||
+                    docItem.merchantOrIssuer ||
+                    docItem.receiptDate ||
+                    docItem.detectedTaxYear ||
+                    docItem.taxReliefCategory
+                );
+
                 return (
                   <div
                     key={`${docItem.docType}-${idx}`}
                     className="px-5 py-4 flex flex-col sm:flex-row sm:items-start justify-between gap-4"
                   >
-                    <div className="space-y-1 min-w-0 flex-1">
+                    <div className="space-y-1.5 min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-3">
                         <span className="text-sm font-medium text-slate-900">
                           {docItem.docType}
                         </span>
                         <DocumentStatusText status={docItem.status} />
+                        {docItem.detectedTaxYear ? (
+                          <span
+                            className={`font-mono text-[11px] font-medium tabular-nums ${
+                              docItem.taxYearValid === false
+                                ? 'text-amber-700'
+                                : 'text-emerald-700'
+                            }`}
+                          >
+                            YA {docItem.detectedTaxYear}
+                            {docItem.taxYearValid === false ? ' (Mismatch)' : ' (Matched)'}
+                          </span>
+                        ) : docItem.taxYearValid === false ? (
+                          <span className="font-mono text-[11px] font-medium text-amber-700">
+                            YA Mismatch
+                          </span>
+                        ) : null}
                       </div>
 
                       {docItem.fileName ? (
-                        <div className="text-xs text-slate-600 flex flex-wrap items-center gap-2 font-mono">
-                          <FileText className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                          <span className="truncate max-w-xs">{docItem.fileName}</span>
-                          {docItem.extractedAmount !== null && (
-                            <>
-                              <span className="text-slate-300" aria-hidden="true">·</span>
-                              <span className="font-semibold text-slate-900 tabular-nums">
-                                {formatMyr(docItem.extractedAmount)}
-                              </span>
-                            </>
-                          )}
-                          {docItem.taxYearValid === false && (
-                            <>
-                              <span className="text-slate-300" aria-hidden="true">·</span>
-                              <span className="text-amber-700 font-sans font-medium">
-                                Wrong tax year detected
-                              </span>
-                            </>
+                        <div className="space-y-1">
+                          <div className="text-xs text-slate-600 flex flex-wrap items-center gap-2 font-mono">
+                            <FileText className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                            <span className="truncate max-w-xs">{docItem.fileName}</span>
+                            {docItem.extractedAmount !== null && (
+                              <>
+                                <span className="text-slate-300" aria-hidden="true">·</span>
+                                <span className="font-semibold text-slate-900 tabular-nums">
+                                  {formatMyr(docItem.extractedAmount)}
+                                </span>
+                              </>
+                            )}
+                          </div>
+
+                          {hasExtractedMeta && (
+                            <div className="text-xs text-slate-600 flex flex-wrap items-center gap-x-2 gap-y-1">
+                              {docItem.documentCategory && (
+                                <span className="font-medium text-slate-800">
+                                  {docItem.documentCategory}
+                                </span>
+                              )}
+                              {docItem.merchantOrIssuer && (
+                                <>
+                                  <span className="text-slate-300" aria-hidden="true">·</span>
+                                  <span>Issuer: {docItem.merchantOrIssuer}</span>
+                                </>
+                              )}
+                              {docItem.receiptDate && (
+                                <>
+                                  <span className="text-slate-300" aria-hidden="true">·</span>
+                                  <span className="font-mono tabular-nums">
+                                    Date: {docItem.receiptDate}
+                                  </span>
+                                </>
+                              )}
+                              {docItem.taxReliefCategory && (
+                                <>
+                                  <span className="text-slate-300" aria-hidden="true">·</span>
+                                  <span className="text-teal-800 font-medium">
+                                    LHDN Relief: {docItem.taxReliefCategory}
+                                  </span>
+                                </>
+                              )}
+                            </div>
                           )}
                         </div>
                       ) : (
@@ -620,7 +722,7 @@ export function ClientDossier({
                       )}
 
                       {docItem.notes && (
-                        <p className="text-xs text-slate-600 bg-slate-50 border border-slate-200/80 rounded-md px-3 py-1.5 mt-1.5">
+                        <p className="text-xs text-slate-600 bg-slate-50 border border-slate-200/80 rounded-md px-3 py-1.5 mt-1">
                           {docItem.notes}
                         </p>
                       )}
@@ -694,15 +796,15 @@ export function ClientDossier({
               )}
           </section>
 
-          {/* AI Multimodal Document Upload & Gemini 2.5 Flash Verification Engine */}
+          {/* AI Multimodal Document Upload & Gemini 3.8 Flash Reader */}
           <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <div>
                 <h3 className="text-sm font-semibold text-slate-900">
-                  Upload &amp; Verify Tax Documents
+                  Upload &amp; Analyze Tax Documents
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Attach PDFs or scanned photos. Gemini 2.5 Flash classifies each form, verifies YA {client.taxYear}, and updates your checklist automatically.
+                  Upload PDFs or receipt images (max 15MB). Gemini 3.8 Flash reads each document, extracts issuer, date, MYR amount, and LHDN relief category, verifies YA {client.taxYear}, and updates the checklist automatically.
                 </p>
               </div>
             </div>
@@ -719,93 +821,64 @@ export function ClientDossier({
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
-                    setDragging(true);
+                    if (!analyzing) setDragging(true);
                   }}
                   onDragLeave={() => setDragging(false)}
                   onDrop={(e) => {
                     e.preventDefault();
                     setDragging(false);
-                    if (e.dataTransfer.files) handleFilesSelected(e.dataTransfer.files);
+                    if (!analyzing && e.dataTransfer.files) {
+                      handleFilesSelected(e.dataTransfer.files);
+                    }
                   }}
-                  onClick={() => fileInputRef.current?.click()}
-                  className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
-                    dragging
-                      ? 'border-teal-600 bg-teal-50/40'
-                      : 'border-slate-300 hover:border-slate-400 bg-slate-50/50'
+                  onClick={() => {
+                    if (!analyzing) fileInputRef.current?.click();
+                  }}
+                  className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+                    analyzing
+                      ? 'border-teal-400 bg-teal-50/40 cursor-wait'
+                      : dragging
+                        ? 'border-teal-600 bg-teal-50/40 cursor-pointer'
+                        : 'border-slate-300 hover:border-slate-400 bg-slate-50/50 cursor-pointer'
                   }`}
                 >
                   <input
                     ref={fileInputRef}
                     type="file"
                     multiple
-                    accept=".pdf,image/png,image/jpeg,image/webp"
+                    disabled={analyzing}
+                    accept="application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp"
                     onChange={(e) => {
                       if (e.target.files) handleFilesSelected(e.target.files);
                       e.target.value = '';
                     }}
                     className="hidden"
                   />
-                  <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2.5" />
-                  <p className="text-sm font-medium text-slate-800">
-                    Drop tax PDFs or receipt scans here, or click to browse
-                  </p>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Supports EA Form, EPF/KWSP Statement, CP58, Zakat, Medical &amp; Dividend Vouchers (PDF, PNG, JPG · up to 10 files)
-                  </p>
-                </div>
-
-                {/* Staged Files List */}
-                {stagedFiles.length > 0 && (
-                  <div className="border border-slate-200 rounded-lg divide-y divide-slate-100">
-                    {stagedFiles.map((file, idx) => (
-                      <div
-                        key={`${file.name}-${idx}`}
-                        className="px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileText className="w-4 h-4 text-teal-700 shrink-0" />
-                          <span className="font-medium text-slate-800 truncate">{file.name}</span>
-                          <span className="text-slate-400 font-mono tabular-nums shrink-0">
-                            {(file.size / 1024).toFixed(0)} KB
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setStagedFiles((prev) => prev.filter((_, i) => i !== idx))
-                          }
-                          className="p-1 text-slate-400 hover:text-red-700 cursor-pointer"
-                          aria-label={`Remove ${file.name}`}
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                    <div className="px-3.5 py-3 bg-slate-50 flex items-center justify-between gap-4">
-                      <span className="text-xs text-slate-600">
-                        {stagedFiles.length} file{stagedFiles.length === 1 ? '' : 's'} ready for Gemini 2.5 Flash verification
-                      </span>
-                      <button
-                        type="button"
-                        onClick={handleRunVerification}
-                        disabled={verifying}
-                        className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      >
-                        {verifying ? (
-                          <>
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                            <span>Inspecting Documents...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-3.5 h-3.5" />
-                            <span>Run AI Document Verification</span>
-                          </>
-                        )}
-                      </button>
+                  {analyzing ? (
+                    <div className="space-y-2">
+                      <RefreshCw className="w-6 h-6 text-teal-700 mx-auto animate-spin" />
+                      <p className="text-sm font-semibold text-teal-900">
+                        Analyzing with Gemini 3.8 Flash...
+                      </p>
+                      {analyzingProgress && (
+                        <p className="text-xs text-teal-800 font-mono">
+                          Reading file {analyzingProgress.index} of {analyzingProgress.total}:{' '}
+                          {analyzingProgress.currentFile}
+                        </p>
+                      )}
                     </div>
-                  </div>
-                )}
+                  ) : (
+                    <>
+                      <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2.5" />
+                      <p className="text-sm font-medium text-slate-800">
+                        Drop tax PDFs or receipt scans here, or click to browse
+                      </p>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Auto-analyzes EA Form, EPF/KWSP, CP58, Medical, Lifestyle, Insurance, Zakat &amp; Dividend Vouchers (PDF, JPEG, PNG, WebP · max 15MB)
+                      </p>
+                    </>
+                  )}
+                </div>
 
                 {verifyError && (
                   <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 flex items-start gap-2">
@@ -814,56 +887,98 @@ export function ClientDossier({
                   </div>
                 )}
 
-                {/* Latest Gemini Structured Verification Output */}
-                {lastAiResult && (
+                {/* Latest Gemini Structured Extraction Output */}
+                {latestAnalysisSummary && (
                   <div className="border border-teal-200 bg-teal-50/40 rounded-xl p-5 space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
                         <FileCheck className="w-4 h-4 text-teal-700" />
-                        <span>Latest AI Verification Summary</span>
+                        <span>Latest Gemini Extraction Summary</span>
                       </div>
-                      <JobStatusText status={lastAiResult.recommendedJobStatus} />
+                      <JobStatusText status={latestAnalysisSummary.finalStatus} />
                     </div>
 
                     <div className="divide-y divide-teal-200/60 border-t border-b border-teal-200/60">
-                      {lastAiResult.detectedDocuments.map((det, i) => (
-                        <div key={`${det.fileName}-${i}`} className="py-2.5 text-xs space-y-1">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-mono font-medium text-slate-900">
-                              {det.fileName}
-                            </span>
-                            <span
-                              className={
-                                det.taxYearValid
-                                  ? 'font-medium text-emerald-700'
-                                  : 'font-medium text-amber-700'
-                              }
-                            >
-                              {det.taxYearValid
-                                ? `YA ${client.taxYear} Verified`
-                                : `Tax Year Mismatch / Invalid`}
-                            </span>
-                          </div>
-                          <div className="text-slate-700 flex flex-wrap items-center gap-2">
-                            <span>Detected: {det.documentCategory}</span>
-                            {typeof det.extractedAmount === 'number' && det.extractedAmount > 0 && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono font-medium tabular-nums">
-                                  {formatMyr(det.extractedAmount)}
+                      {latestAnalysisSummary.results.map((item, i) => {
+                        const verified = item.isLegible && item.taxYearMatches;
+                        return (
+                          <div key={`${item.fileName}-${i}`} className="py-3 text-xs space-y-1.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-mono font-medium text-slate-900">
+                                {item.fileName}
+                              </span>
+                              <span
+                                className={
+                                  verified
+                                    ? 'font-semibold text-emerald-700'
+                                    : 'font-semibold text-amber-700'
+                                }
+                              >
+                                {verified ? 'Verified' : 'Needs Review'}
+                                {' · '}
+                                {item.taxYear > 0
+                                  ? `YA ${item.taxYear}${item.taxYearMatches ? '' : ' (Mismatch)'}`
+                                  : 'YA Not Found'}
+                              </span>
+                            </div>
+
+                            <div className="text-slate-700 flex flex-wrap items-center gap-x-2 gap-y-1">
+                              <span className="font-medium text-slate-900">
+                                {item.documentCategory}
+                              </span>
+                              {item.merchantOrIssuer && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span>Issuer: {item.merchantOrIssuer}</span>
+                                </>
+                              )}
+                              {item.receiptDate && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="font-mono tabular-nums">
+                                    {item.receiptDate}
+                                  </span>
+                                </>
+                              )}
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono font-semibold text-slate-900 tabular-nums">
+                                {formatMyr(item.totalAmountMYR)}
+                              </span>
+                              {item.taxReliefCategory && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-teal-800 font-medium">
+                                    LHDN: {item.taxReliefCategory}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+
+                            {item.matchedChecklistItem ? (
+                              <p className="text-slate-600">
+                                Matched checklist item:{' '}
+                                <span className="font-medium text-slate-900">
+                                  {item.matchedChecklistItem}
                                 </span>
-                              </>
+                              </p>
+                            ) : (
+                              <p className="text-amber-700">
+                                No matching item in this client&apos;s current required checklist.
+                              </p>
+                            )}
+
+                            {item.confidenceNotes && (
+                              <p className="text-slate-600">{item.confidenceNotes}</p>
                             )}
                           </div>
-                          {det.notes && <p className="text-slate-600">{det.notes}</p>}
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
 
-                    {lastAiResult.missingDocuments.length > 0 ? (
+                    {latestAnalysisSummary.missingDocuments.length > 0 ? (
                       <div className="text-xs text-slate-700">
                         <span className="font-semibold text-slate-900">Still missing: </span>
-                        <span>{lastAiResult.missingDocuments.join(', ')}</span>
+                        <span>{latestAnalysisSummary.missingDocuments.join(', ')}</span>
                       </div>
                     ) : (
                       <div className="text-xs font-medium text-emerald-800 flex items-center gap-1.5">

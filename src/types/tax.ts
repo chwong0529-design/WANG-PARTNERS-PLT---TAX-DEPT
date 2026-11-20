@@ -13,7 +13,18 @@ export interface UserProfile {
 
 export type JobStatus = 'No Book In' | 'Pending Document' | 'Book In Can Start';
 
-export type DocumentStatus = 'Verified' | 'Missing' | 'Invalid';
+export type DocumentStatus = 'Verified' | 'Needs Review' | 'Missing' | 'Invalid';
+
+export type AnalyzeDocumentCategory =
+  | 'EA Form / Employment Income'
+  | 'EPF / KWSP Statement'
+  | 'CP58 Commission Statement'
+  | 'Medical Receipt'
+  | 'Lifestyle / Tech Receipt'
+  | 'Insurance / Takaful Statement'
+  | 'Zakat / Approved Donation Receipt'
+  | 'Dividend / Bank Interest Voucher'
+  | 'Unrecognized / Blurry';
 
 export type FilingCategory =
   | 'Form BE (Salaried)'
@@ -36,6 +47,12 @@ export interface RequiredDocumentItem {
   extractedAmount: number | null;
   taxYearValid: boolean | null;
   notes: string;
+  documentCategory?: string | null;
+  isLegible?: boolean | null;
+  merchantOrIssuer?: string | null;
+  receiptDate?: string | null;
+  detectedTaxYear?: number | null;
+  taxReliefCategory?: string | null;
 }
 
 export interface TaxClient {
@@ -61,13 +78,32 @@ export interface TaxClient {
   updatedAt: Timestamp | null;
 }
 
+export interface AnalyzeDocumentResult {
+  fileName: string;
+  documentCategory: AnalyzeDocumentCategory;
+  isLegible: boolean;
+  merchantOrIssuer: string;
+  receiptDate: string;
+  taxYear: number;
+  taxYearMatches: boolean;
+  totalAmountMYR: number;
+  taxReliefCategory: string;
+  confidenceNotes: string;
+  matchedChecklistItem: string;
+}
+
 export interface DetectedDocumentResult {
   fileName: string;
   documentCategory: string;
   matchedChecklistDocType?: string;
   taxpayerName?: string;
+  merchantOrIssuer?: string;
+  receiptDate?: string;
+  taxYear?: number;
   taxYearValid: boolean;
+  isLegible?: boolean;
   extractedAmount?: number;
+  taxReliefCategory?: string;
   notes?: string;
 }
 

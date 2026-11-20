@@ -26,6 +26,7 @@ const ACTION_LABELS: Record<string, string> = {
   PAGE_VIEW: 'Page View',
   USER_SIGN_IN: 'User Sign-In',
   USER_SIGN_OUT: 'User Sign-Out',
+  AUTO_LOGOUT_IDLE: 'Auto Logout (Idle)',
   CREATE_CLIENT: 'Create Client',
   UPLOAD_TAX_DOCUMENT: 'Upload Tax Document',
   AI_DOCUMENT_VERIFICATION: 'AI Document Verification',
@@ -50,6 +51,7 @@ function getActionTone(action: string): string {
     case 'DISPATCH_REMINDER':
     case 'ASSIGN_DUTY':
     case 'CREATE_CLIENT':
+    case 'AUTO_LOGOUT_IDLE':
       return 'text-amber-700';
     case 'EXPORT_AUDIT_LOG':
       return 'text-indigo-700';
