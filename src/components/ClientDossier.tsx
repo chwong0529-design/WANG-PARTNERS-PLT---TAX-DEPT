@@ -37,13 +37,11 @@ import {
   determineWorkflowStage,
   dispatchReminder,
   draftReminderApi,
-  generateSampleTaxDocumentFile,
   subscribeToClientHistory,
   toggleClientLock,
   updateClientChecklistItem,
   updateClientChecklistStructure,
   verifyTaxDocumentsApi,
-  type SampleSpecimenKind,
 } from '../lib/taxService';
 import { DocumentStatusText, formatMyr, JobStatusText } from './StatusIndicator';
 
@@ -131,16 +129,6 @@ export function ClientDossier({
     }
     setVerifyError(null);
     setStagedFiles((prev) => [...prev, ...accepted].slice(0, 10));
-  };
-
-  const handleAttachSample = async (kind: SampleSpecimenKind) => {
-    setVerifyError(null);
-    try {
-      const sampleFile = await generateSampleTaxDocumentFile(kind, client.name, client.taxYear);
-      setStagedFiles((prev) => [...prev, sampleFile].slice(0, 10));
-    } catch (err) {
-      setVerifyError(err instanceof Error ? err.message : 'Could not create sample specimen.');
-    }
   };
 
   const handleRunVerification = async () => {
@@ -603,32 +591,6 @@ export function ClientDossier({
                   <p className="text-xs text-slate-500 mt-1">
                     Supports EA Form, EPF/KWSP Statement, CP58, Zakat, Medical &amp; Dividend Vouchers (PDF, PNG, JPG · up to 10 files)
                   </p>
-                </div>
-
-                {/* Quick Specimen Attachment for Live Multimodal Testing */}
-                <div className="pt-1 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs">
-                  <span className="text-slate-500 font-medium">
-                    Test with sample Malaysia forms:
-                  </span>
-                  {(
-                    [
-                      ['ea_2026', `EA Form YA ${client.taxYear}`],
-                      ['epf_2026', `EPF/KWSP ${client.taxYear}`],
-                      ['medical_2026', `Medical Receipt ${client.taxYear}`],
-                      ['cp58_2026', `CP58 ${client.taxYear}`],
-                      ['zakat_2026', `Zakat Receipt ${client.taxYear}`],
-                      ['ea_wrong_year_2024', 'Old 2024 EA Form (Mismatch Test)'],
-                    ] as Array<[SampleSpecimenKind, string]>
-                  ).map(([kind, label]) => (
-                    <button
-                      key={kind}
-                      type="button"
-                      onClick={() => handleAttachSample(kind)}
-                      className="text-teal-700 hover:text-teal-950 underline underline-offset-2 cursor-pointer"
-                    >
-                      + {label}
-                    </button>
-                  ))}
                 </div>
 
                 {/* Staged Files List */}

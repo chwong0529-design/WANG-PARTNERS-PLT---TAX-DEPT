@@ -4,7 +4,6 @@ import {
   Plus,
   Send,
   FolderOpen,
-  Database,
   ArrowUpRight,
   Lock,
 } from 'lucide-react';
@@ -17,7 +16,6 @@ interface StaffDashboardProps {
   loading: boolean;
   onSelectClient: (clientId: string) => void;
   onOpenNewClient: () => void;
-  onSeedPortfolio: () => Promise<void>;
   onGoToReminders: (clientId?: string) => void;
 }
 
@@ -28,13 +26,11 @@ export function StaffDashboard({
   loading,
   onSelectClient,
   onOpenNewClient,
-  onSeedPortfolio,
   onGoToReminders,
 }: StaffDashboardProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const [yearFilter, setYearFilter] = useState<string>('All');
-  const [seeding, setSeeding] = useState(false);
 
   const years = useMemo(() => {
     const unique = Array.from(new Set(clients.map((c) => c.taxYear))).sort((a, b) => b - a);
@@ -65,18 +61,9 @@ export function StaffDashboard({
     });
   }, [clients, searchQuery, statusFilter, yearFilter]);
 
-  const handleSeed = async () => {
-    setSeeding(true);
-    try {
-      await onSeedPortfolio();
-    } finally {
-      setSeeding(false);
-    }
-  };
-
   return (
     <div className="space-y-6">
-      {/* KPI Metric Strip — Clean horizontal grid with hairline dividers, zero nested cards */}
+      {/* KPI Metric Strip */}
       <section
         aria-label="Portfolio summary metrics"
         className="bg-white border border-slate-200 rounded-xl grid grid-cols-2 lg:grid-cols-5 divide-y lg:divide-y-0 lg:divide-x divide-slate-200"
@@ -182,24 +169,13 @@ export function StaffDashboard({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {clients.length === 0 && !loading && (
-              <button
-                type="button"
-                onClick={handleSeed}
-                disabled={seeding}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Database className="w-3.5 h-3.5" />
-                <span>{seeding ? 'Loading Samples...' : 'Load Sample YA 2026 Portfolio'}</span>
-              </button>
-            )}
             <button
               type="button"
               onClick={onOpenNewClient}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>New Tax File</span>
+              <span>+ New Client</span>
             </button>
           </div>
         </div>
@@ -222,10 +198,10 @@ export function StaffDashboard({
           <div className="px-6 py-16 text-center max-w-md mx-auto">
             <FolderOpen className="w-8 h-8 text-slate-400 mx-auto mb-3" />
             <h3 className="text-base font-semibold text-slate-900">
-              No personal tax files tracked yet
+              No clients added yet
             </h3>
             <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
-              Create your first Malaysia YA 2026 taxpayer engagement or load a sample portfolio to test Gemini 2.5 Flash document verification and automated 7-day follow-ups.
+              Click "+ New Client" to add your first taxpayer.
             </p>
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
               <button
@@ -234,16 +210,7 @@ export function StaffDashboard({
                 className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors cursor-pointer"
               >
                 <Plus className="w-4 h-4" />
-                Create First Tax File
-              </button>
-              <button
-                type="button"
-                onClick={handleSeed}
-                disabled={seeding}
-                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer"
-              >
-                <Database className="w-4 h-4" />
-                {seeding ? 'Loading...' : 'Load Sample YA 2026 Portfolio'}
+                <span>+ New Client</span>
               </button>
             </div>
           </div>

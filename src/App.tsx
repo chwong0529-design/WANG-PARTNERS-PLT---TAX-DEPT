@@ -14,7 +14,6 @@ import { auth, googleProvider } from './lib/firebase';
 import {
   checkIsAdmin,
   determineWorkflowStage,
-  seedSamplePortfolio,
   subscribeToClients,
 } from './lib/taxService';
 import type { TaxClient } from './types/tax';
@@ -334,7 +333,7 @@ function CukaiDeskApp() {
 
       {/* Main Content Area */}
       <div className="flex-1 min-w-0 flex flex-col">
-        {/* Top Bar Contract: Breadcrumb on left, 1 primary action on right */}
+        {/* Top Bar Contract */}
         <header className="h-16 bg-white border-b border-slate-200 px-6 flex items-center justify-between gap-6 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -372,7 +371,7 @@ function CukaiDeskApp() {
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>{isAdmin ? 'New Tax File' : 'Open YA 2026 File'}</span>
+              <span>{isAdmin ? '+ New Client' : 'Open YA 2026 File'}</span>
             </button>
           </div>
         </header>
@@ -416,7 +415,7 @@ function CukaiDeskApp() {
                 </h2>
                 <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
                   {isAdmin
-                    ? 'Create a client tax file or load the sample YA 2026 portfolio from the Client Queue first to preview the taxpayer portal.'
+                    ? 'No clients added yet. Click "+ New Client" to add your first taxpayer.'
                     : 'Open your YA 2026 personal tax checklist to upload your EA Form, EPF/KWSP statement, and relief receipts for instant AI verification.'}
                 </p>
                 <button
@@ -425,7 +424,7 @@ function CukaiDeskApp() {
                   className="mt-5 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors cursor-pointer"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>{isAdmin ? 'Create Tax File' : 'Open My YA 2026 File'}</span>
+                  <span>{isAdmin ? '+ New Client' : 'Open My YA 2026 File'}</span>
                 </button>
               </div>
             )
@@ -450,7 +449,6 @@ function CukaiDeskApp() {
                 setPortalMode('staff');
               }}
               onOpenNewClient={() => setShowNewClientModal(true)}
-              onSeedPortfolio={seedSamplePortfolio}
               onGoToReminders={(clientId) => {
                 setHighlightedReminderClient(clientId ?? null);
                 setActiveNav('reminders');
