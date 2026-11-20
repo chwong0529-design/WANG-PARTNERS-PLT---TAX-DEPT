@@ -1,8 +1,10 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import multer from 'multer';
+import QRCode from 'qrcode';
 import { GoogleGenAI, Type } from '@google/genai';
 
 dotenv.config();
@@ -47,6 +49,75 @@ function assertGeminiKey(): void {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Standard RFC 6238 TOTP Implementation (Secrets Strictly Server-Side)
+// ---------------------------------------------------------------------------
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const TOTP_PERIOD_SECONDS = 30;
+const TOTP_DIGITS = 6;
+const TOTP_ISSUER = 'CukaiDesk';
+
+// Secrets are held strictly on the backend and never exposed to the browser
+const pendingTotpSecrets = new Map<string, { secret: Buffer; createdAt: number }>();
+const boundTotpSecrets = new Map<string, { secret: Buffer; boundAt: number }>();
+
+function encodeBase32(buffer: Buffer): string {
+  let bits = 0;
+  let value = 0;
+  let output = '';
+  for (let i = 0; i < buffer.length; i += 1) {
+    value = (value << 8) | buffer[i];
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return output;
+}
+
+function generateHotp(secret: Buffer, counter: number): string {
+  const counterBuf = Buffer.alloc(8);
+  const high = Math.floor(counter / 0x100000000);
+  const low = counter >>> 0;
+  counterBuf.writeUInt32BE(high, 0);
+  counterBuf.writeUInt32BE(low, 4);
+
+  const hmac = crypto.createHmac('sha1', secret).update(counterBuf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const binary =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+
+  const otp = binary % 10 ** TOTP_DIGITS;
+  return String(otp).padStart(TOTP_DIGITS, '0');
+}
+
+function verifyTotpCode(secret: Buffer, submittedCode: string, windowSteps = 1): boolean {
+  const cleanCode = submittedCode.replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(cleanCode)) return false;
+
+  const currentCounter = Math.floor(Date.now() / 1000 / TOTP_PERIOD_SECONDS);
+  const codeBuf = Buffer.from(cleanCode, 'utf8');
+
+  for (let delta = -windowSteps; delta <= windowSteps; delta += 1) {
+    const candidate = generateHotp(secret, currentCounter + delta);
+    const candidateBuf = Buffer.from(candidate, 'utf8');
+    if (
+      candidateBuf.length === codeBuf.length &&
+      crypto.timingSafeEqual(candidateBuf, codeBuf)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const upload = multer({
@@ -152,6 +223,117 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, model: GEMINI_MODEL });
+  });
+
+  /**
+   * POST /api/2fa/setup
+   * Generates a fresh RFC 6238 TOTP secret strictly on the server and returns
+   * only a scannable authenticator QR code data URL (never exposing raw secret).
+   */
+  app.post('/api/2fa/setup', async (req, res) => {
+    try {
+      const { uid, email } = req.body as { uid?: string; email?: string };
+      const cleanUid = String(uid || '').trim();
+      const cleanEmail = String(email || '').trim().toLowerCase();
+
+      if (!cleanUid || !cleanEmail) {
+        return res.status(400).json({ error: 'Authenticated user uid and email are required.' });
+      }
+
+      const secretBytes = crypto.randomBytes(20);
+      const base32Secret = encodeBase32(secretBytes);
+      pendingTotpSecrets.set(cleanUid, {
+        secret: secretBytes,
+        createdAt: Date.now(),
+      });
+
+      const label = encodeURIComponent(`${TOTP_ISSUER}:${cleanEmail}`);
+      const issuerParam = encodeURIComponent(TOTP_ISSUER);
+      const otpauthUri = `otpauth://totp/${label}?secret=${base32Secret}&issuer=${issuerParam}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD_SECONDS}`;
+
+      const qrCodeDataUrl = await QRCode.toDataURL(otpauthUri, {
+        errorCorrectionLevel: 'M',
+        margin: 2,
+        width: 220,
+        color: {
+          dark: '#0f172a',
+          light: '#ffffff',
+        },
+      });
+
+      return res.json({
+        qrCodeDataUrl,
+        issuer: TOTP_ISSUER,
+        accountName: cleanEmail,
+        digits: TOTP_DIGITS,
+        periodSeconds: TOTP_PERIOD_SECONDS,
+      });
+    } catch (error) {
+      console.error('Error setting up 2FA TOTP:', error);
+      return res.status(500).json({ error: 'Failed to generate authenticator setup QR code.' });
+    }
+  });
+
+  /**
+   * POST /api/2fa/verify
+   * Verifies a 6-digit RFC 6238 TOTP code against the server-stored pending or bound secret.
+   */
+  app.post('/api/2fa/verify', (req, res) => {
+    try {
+      const { uid, code, action } = req.body as {
+        uid?: string;
+        code?: string;
+        action?: 'bind' | 'verify' | 'clear';
+      };
+      const cleanUid = String(uid || '').trim();
+
+      if (!cleanUid) {
+        return res.status(400).json({ valid: false, error: 'Authenticated user uid is required.' });
+      }
+
+      if (action === 'clear') {
+        pendingTotpSecrets.delete(cleanUid);
+        boundTotpSecrets.delete(cleanUid);
+        return res.json({ valid: true, cleared: true });
+      }
+
+      const cleanCode = String(code || '').replace(/\s+/g, '');
+      if (!/^\d{6}$/.test(cleanCode)) {
+        return res
+          .status(400)
+          .json({ valid: false, error: 'Enter a valid 6-digit authenticator code.' });
+      }
+
+      const pending = pendingTotpSecrets.get(cleanUid);
+      if (pending && verifyTotpCode(pending.secret, cleanCode, 1)) {
+        boundTotpSecrets.set(cleanUid, {
+          secret: pending.secret,
+          boundAt: Date.now(),
+        });
+        pendingTotpSecrets.delete(cleanUid);
+        return res.json({ valid: true, bound: true, verifiedAt: new Date().toISOString() });
+      }
+
+      const bound = boundTotpSecrets.get(cleanUid);
+      if (bound && verifyTotpCode(bound.secret, cleanCode, 1)) {
+        return res.json({ valid: true, bound: true, verifiedAt: new Date().toISOString() });
+      }
+
+      if (!pending && !bound) {
+        return res.status(400).json({
+          valid: false,
+          error: 'No active authenticator setup found on the server. Generate a fresh QR code first.',
+        });
+      }
+
+      return res.status(400).json({
+        valid: false,
+        error: 'Invalid or expired 6-digit code. Check your authenticator app and try again.',
+      });
+    } catch (error) {
+      console.error('Error verifying 2FA TOTP code:', error);
+      return res.status(500).json({ valid: false, error: 'Failed to verify authenticator code.' });
+    }
   });
 
   /**

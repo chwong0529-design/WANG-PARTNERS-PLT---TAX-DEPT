@@ -11,12 +11,14 @@ import {
   FolderOpen,
   UserCog,
   ClipboardList,
+  ShieldAlert,
 } from 'lucide-react';
 import { auth, googleProvider, unsubscribeAllFirestoreListeners } from './lib/firebase';
 import {
   determineWorkflowStage,
   initializeUserProfile,
   subscribeToClients,
+  subscribeToUserProfile,
   getAllUserProfiles,
 } from './lib/taxService';
 import { logActivity, setAuditUserContext } from './lib/auditService';
@@ -34,9 +36,10 @@ import { ReminderQueueView } from './components/ReminderQueueView';
 import { NewClientModal } from './components/NewClientModal';
 import { UserRoleManagementModal } from './components/UserRoleManagementModal';
 import { AuditTrailView } from './components/AuditTrailView';
+import { DangerZoneView } from './components/DangerZoneView';
 import { IdleWarningModal } from './components/IdleWarningModal';
 
-type NavSection = 'clients' | 'reminders' | 'client-portal' | 'audit-trail';
+type NavSection = 'clients' | 'reminders' | 'client-portal' | 'audit-trail' | 'danger-zone';
 
 function CukaiDeskApp() {
   const [user, setUser] = useState<User | null>(null);
@@ -109,6 +112,24 @@ function CukaiDeskApp() {
   }, []);
 
   useEffect(() => {
+    if (!authReady || !user || isSigningOut) return;
+    const unsub = subscribeToUserProfile(
+      user.uid,
+      (liveProfile) => {
+        if (liveProfile) {
+          setAuditUserContext(liveProfile);
+          setUserProfile(liveProfile);
+        }
+      },
+      (err) => {
+        if (signingOutRef.current) return;
+        console.error('Live profile sync error:', err);
+      }
+    );
+    return () => unsub();
+  }, [authReady, user, isSigningOut]);
+
+  useEffect(() => {
     if (!authReady || !user || !user.email || isSigningOut) {
       setClientsLoading(false);
       return;
@@ -166,6 +187,7 @@ function CukaiDeskApp() {
   );
 
   const currentPageLabel = useMemo(() => {
+    if (activeNav === 'danger-zone') return 'Danger Zone';
     if (activeNav === 'audit-trail' && isAdminOrManager) return 'Audit Trail';
     if (activeNav === 'reminders' && isAdminOrManager) return 'Follow-Up Queue';
     if (!isAdminOrManager || activeNav === 'client-portal') {
@@ -287,6 +309,9 @@ function CukaiDeskApp() {
   }
 
   const currentBreadcrumb = (() => {
+    if (activeNav === 'danger-zone') {
+      return 'Security / Danger Zone';
+    }
     if (activeNav === 'audit-trail' && isAdminOrManager) {
       return 'Compliance / User Activity & Audit Trail';
     }
@@ -413,12 +438,31 @@ function CukaiDeskApp() {
             <button
               type="button"
               onClick={() => handleNavClick('client-portal')}
-              className="w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg bg-slate-100 text-slate-900 whitespace-nowrap cursor-pointer"
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+                activeNav === 'client-portal'
+                  ? 'bg-slate-100 text-slate-900'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
             >
               <FileCheck2 className="w-4 h-4 shrink-0" />
               <span>My Tax Checklist</span>
             </button>
           )}
+
+          <div className="pt-3 mt-3 border-t border-slate-200">
+            <button
+              type="button"
+              onClick={() => handleNavClick('danger-zone')}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+                activeNav === 'danger-zone'
+                  ? 'bg-red-50 text-red-700'
+                  : 'text-red-700/85 hover:bg-red-50/70 hover:text-red-800'
+              }`}
+            >
+              <ShieldAlert className="w-4 h-4 shrink-0 text-red-600" />
+              <span>Danger Zone</span>
+            </button>
+          </div>
         </nav>
 
         <div className="p-4 border-t border-slate-200 space-y-3">
@@ -509,11 +553,30 @@ function CukaiDeskApp() {
                 <button
                   type="button"
                   onClick={() => handleNavClick('client-portal')}
-                  className="w-full text-left px-3 py-2.5 text-sm font-medium text-slate-900 bg-slate-100 rounded-lg"
+                  className={`w-full text-left px-3 py-2.5 text-sm font-medium rounded-lg ${
+                    activeNav === 'client-portal'
+                      ? 'text-slate-900 bg-slate-100'
+                      : 'text-slate-700 hover:bg-slate-100'
+                  }`}
                 >
                   My Tax Checklist
                 </button>
               )}
+
+              <div className="pt-2 mt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => handleNavClick('danger-zone')}
+                  className={`w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium rounded-lg ${
+                    activeNav === 'danger-zone'
+                      ? 'bg-red-50 text-red-700'
+                      : 'text-red-700 hover:bg-red-50'
+                  }`}
+                >
+                  <ShieldAlert className="w-4 h-4 shrink-0 text-red-600" />
+                  <span>Danger Zone</span>
+                </button>
+              </div>
             </div>
             <div className="p-4 border-t border-slate-200">
               <button
@@ -587,7 +650,17 @@ function CukaiDeskApp() {
         </header>
 
         <main className="flex-1 p-6 max-w-[1440px] w-full mx-auto">
-          {activeNav === 'audit-trail' && isAdminOrManager ? (
+          {activeNav === 'danger-zone' && userProfile ? (
+            <DangerZoneView
+              userProfile={userProfile}
+              clients={clients}
+              onClientPurged={(purgedId) => {
+                if (selectedClientId === purgedId) {
+                  setSelectedClientId(null);
+                }
+              }}
+            />
+          ) : activeNav === 'audit-trail' && isAdminOrManager ? (
             <AuditTrailView userRole={role} />
           ) : activeNav === 'reminders' && isAdminOrManager ? (
             <ReminderQueueView

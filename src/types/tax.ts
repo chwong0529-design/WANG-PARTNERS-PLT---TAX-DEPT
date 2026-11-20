@@ -8,7 +8,50 @@ export interface UserProfile {
   displayName: string;
   role: UserRole;
   assignedClientId?: string | null;
+  twoFactorEnabled: boolean;
+  twoFactorLocked: boolean;
+  twoFactorApprovedUntil?: Timestamp | null;
   createdAt: Timestamp | null;
+}
+
+export type TwoFactorRequestType =
+  | 'DISABLE_2FA'
+  | 'RESET_2FA_SECRET'
+  | 'CHANGE_2FA_METHOD';
+
+export type TwoFactorRequestStatus =
+  | 'PENDING'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'COMPLETED';
+
+export interface TwoFactorChangeRequest {
+  id: string;
+  requesterUid: string;
+  requesterEmail: string;
+  requesterRole: UserRole;
+  requestType: TwoFactorRequestType;
+  reason: string;
+  status: TwoFactorRequestStatus;
+  createdAt: Timestamp | null;
+  reviewedByUid?: string | null;
+  reviewedByEmail?: string | null;
+  reviewedAt?: Timestamp | null;
+}
+
+export interface SystemSecuritySettings {
+  require2faForAdminAndManager: boolean;
+  updatedByUid?: string | null;
+  updatedByEmail?: string | null;
+  updatedAt?: Timestamp | null;
+}
+
+export interface TwoFactorSetupResponse {
+  qrCodeDataUrl: string;
+  issuer: string;
+  accountName: string;
+  digits: number;
+  periodSeconds: number;
 }
 
 export type JobStatus = 'No Book In' | 'Pending Document' | 'Book In Can Start';

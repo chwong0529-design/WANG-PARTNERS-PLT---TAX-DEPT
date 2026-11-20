@@ -67,12 +67,24 @@ service cloud.firestore {
     }
 
     function isValidUserProfile(data) {
-      return data.keys().hasOnly([
+      return data.keys().hasAll([
+        'uid',
+        'email',
+        'displayName',
+        'role',
+        'twoFactorEnabled',
+        'twoFactorLocked',
+        'createdAt'
+      ]) &&
+      data.keys().hasOnly([
         'uid',
         'email',
         'displayName',
         'role',
         'assignedClientId',
+        'twoFactorEnabled',
+        'twoFactorLocked',
+        'twoFactorApprovedUntil',
         'createdAt'
       ]) &&
       isValidId(data.uid) &&
@@ -81,12 +93,24 @@ service cloud.firestore {
       data.displayName.size() >= 1 &&
       data.displayName.size() <= 120 &&
       data.role in ['administrator', 'manager', 'user'] &&
-      (data.assignedClientId == null || (data.assignedClientId is string && data.assignedClientId.size() <= 64)) &&
+      (!('assignedClientId' in data) || data.assignedClientId == null || (data.assignedClientId is string && data.assignedClientId.size() <= 64)) &&
+      data.twoFactorEnabled is bool &&
+      data.twoFactorLocked is bool &&
+      (!('twoFactorApprovedUntil' in data) || data.twoFactorApprovedUntil == null || data.twoFactorApprovedUntil is timestamp) &&
       data.createdAt is timestamp;
     }
 
     function isValidAuditLog(data) {
-      return data.keys().hasOnly([
+      return data.keys().hasAll([
+        'timestamp',
+        'userId',
+        'userEmail',
+        'userRole',
+        'pageVisited',
+        'actionTaken',
+        'details'
+      ]) &&
+      data.keys().hasOnly([
         'timestamp',
         'userId',
         'userEmail',
@@ -109,6 +133,61 @@ service cloud.firestore {
       data.details.size() <= 1500;
     }
 
+    function isValidTwoFactorRequest(data) {
+      return data.keys().hasAll([
+        'requesterUid',
+        'requesterEmail',
+        'requesterRole',
+        'requestType',
+        'reason',
+        'status',
+        'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'requesterUid',
+        'requesterEmail',
+        'requesterRole',
+        'requestType',
+        'reason',
+        'status',
+        'createdAt',
+        'reviewedByUid',
+        'reviewedByEmail',
+        'reviewedAt'
+      ]) &&
+      isValidId(data.requesterUid) &&
+      isValidEmailStr(data.requesterEmail) &&
+      data.requesterRole in ['administrator', 'manager', 'user'] &&
+      data.requestType in ['DISABLE_2FA', 'RESET_2FA_SECRET', 'CHANGE_2FA_METHOD'] &&
+      data.reason is string &&
+      data.reason.size() >= 5 &&
+      data.reason.size() <= 500 &&
+      data.status in ['PENDING', 'APPROVED', 'REJECTED', 'COMPLETED'] &&
+      data.createdAt is timestamp &&
+      (!('reviewedByUid' in data) || data.reviewedByUid == null || isValidId(data.reviewedByUid)) &&
+      (!('reviewedByEmail' in data) || data.reviewedByEmail == null || isValidEmailStr(data.reviewedByEmail)) &&
+      (!('reviewedAt' in data) || data.reviewedAt == null || data.reviewedAt is timestamp);
+    }
+
+    function isValidSecuritySettings(data) {
+      return data.keys().hasAll([
+        'require2faForAdminAndManager',
+        'updatedByUid',
+        'updatedByEmail',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'require2faForAdminAndManager',
+        'updatedByUid',
+        'updatedByEmail',
+        'updatedAt'
+      ]) &&
+      data.require2faForAdminAndManager is bool &&
+      isValidId(data.updatedByUid) &&
+      isValidEmailStr(data.updatedByEmail) &&
+      data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection: /users/{uid}
     // -------------------------------------------------------------------------
@@ -121,6 +200,9 @@ service cloud.firestore {
         request.auth.uid == uid &&
         isValidUserProfile(incoming()) &&
         incoming().uid == request.auth.uid &&
+        incoming().twoFactorEnabled == false &&
+        incoming().twoFactorLocked == true &&
+        (!('twoFactorApprovedUntil' in incoming()) || incoming().twoFactorApprovedUntil == null) &&
         (
           incoming().role == 'user' ||
           (request.auth.token.email == 'chwong0529@gmail.com' && incoming().role == 'administrator')
@@ -130,12 +212,113 @@ service cloud.firestore {
         isValidId(uid) &&
         isValidUserProfile(incoming()) &&
         incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
         (
+          // Action 1: System Administrator update (role assignment, 2FA unlock/lock)
           isAdmin() ||
-          (request.auth.uid == uid && incoming().role == existing().role)
+          // Action 2: Legacy profile 2FA field backfill (defaults locked & disabled)
+          (
+            request.auth.uid == uid &&
+            !('twoFactorLocked' in existing()) &&
+            incoming().role == existing().role &&
+            incoming().twoFactorEnabled == false &&
+            incoming().twoFactorLocked == true &&
+            incoming().twoFactorApprovedUntil == null &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'twoFactorLocked', 'twoFactorApprovedUntil'])
+          ) ||
+          // Action 3: Approved single-use 2FA update by owner (must immediately re-lock)
+          (
+            request.auth.uid == uid &&
+            ('twoFactorLocked' in existing()) &&
+            existing().twoFactorLocked == false &&
+            incoming().role == existing().role &&
+            incoming().twoFactorLocked == true &&
+            incoming().twoFactorApprovedUntil == null &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'twoFactorLocked', 'twoFactorApprovedUntil'])
+          )
         );
 
       allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection: /two_factor_requests/{requestId}
+    // -------------------------------------------------------------------------
+    match /two_factor_requests/{requestId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        (isAdmin() || existing().requesterUid == request.auth.uid);
+
+      allow list: if isAdmin() || (
+        isVerifiedUser() &&
+        existing().requesterUid == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        isValidTwoFactorRequest(incoming()) &&
+        incoming().requesterUid == request.auth.uid &&
+        incoming().requesterEmail.lower() == request.auth.token.email.lower() &&
+        incoming().status == 'PENDING' &&
+        incoming().createdAt == request.time &&
+        (!('reviewedByUid' in incoming()) || incoming().reviewedByUid == null) &&
+        (!('reviewedByEmail' in incoming()) || incoming().reviewedByEmail == null) &&
+        (!('reviewedAt' in incoming()) || incoming().reviewedAt == null);
+
+      allow update: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        isValidTwoFactorRequest(incoming()) &&
+        incoming().requesterUid == existing().requesterUid &&
+        incoming().requesterEmail == existing().requesterEmail &&
+        incoming().requesterRole == existing().requesterRole &&
+        incoming().requestType == existing().requestType &&
+        incoming().reason == existing().reason &&
+        incoming().createdAt == existing().createdAt &&
+        (
+          // Action 1: System Administrator approves or rejects a PENDING request
+          (
+            isAdmin() &&
+            existing().status == 'PENDING' &&
+            incoming().status in ['APPROVED', 'REJECTED'] &&
+            incoming().reviewedByUid == request.auth.uid &&
+            incoming().reviewedByEmail.lower() == request.auth.token.email.lower() &&
+            incoming().reviewedAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedByUid', 'reviewedByEmail', 'reviewedAt'])
+          ) ||
+          // Action 2: Requester completes an APPROVED 2FA change (terminal state)
+          (
+            existing().requesterUid == request.auth.uid &&
+            existing().status == 'APPROVED' &&
+            incoming().status == 'COMPLETED' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status'])
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection: /system_settings/{settingId}
+    // -------------------------------------------------------------------------
+    match /system_settings/{settingId} {
+      allow get: if isVerifiedUser() && isValidId(settingId);
+      allow list: if isAdmin();
+
+      allow create: if isAdmin() &&
+        isValidId(settingId) &&
+        isValidSecuritySettings(incoming()) &&
+        incoming().updatedByUid == request.auth.uid &&
+        incoming().updatedByEmail.lower() == request.auth.token.email.lower() &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isAdmin() &&
+        isValidId(settingId) &&
+        isValidSecuritySettings(incoming()) &&
+        incoming().updatedByUid == request.auth.uid &&
+        incoming().updatedByEmail.lower() == request.auth.token.email.lower() &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
     }
 
     // -------------------------------------------------------------------------

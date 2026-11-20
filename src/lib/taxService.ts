@@ -1,4 +1,5 @@
 import {
+  addDoc,
   collection,
   deleteDoc,
   doc,
@@ -34,7 +35,11 @@ import {
   type ReminderLogRecord,
   type ReminderStage,
   type RequiredDocumentItem,
+  type SystemSecuritySettings,
   type TaxClient,
+  type TwoFactorChangeRequest,
+  type TwoFactorRequestType,
+  type TwoFactorSetupResponse,
   type UserProfile,
   type UserRole,
   type VerificationApiResponse,
@@ -123,17 +128,62 @@ export function determineWorkflowStage(client: TaxClient): {
   };
 }
 
+function normalizeUserProfile(
+  raw: Partial<UserProfile> & { uid?: string; email?: string },
+  fallbackUid = ''
+): UserProfile {
+  const email = (raw.email || '').toLowerCase().trim();
+  return {
+    uid: raw.uid || fallbackUid,
+    email,
+    displayName: raw.displayName || email.split('@')[0] || 'Taxpayer',
+    role: raw.role || 'user',
+    assignedClientId: raw.assignedClientId ?? null,
+    twoFactorEnabled: Boolean(raw.twoFactorEnabled),
+    twoFactorLocked: raw.twoFactorLocked !== false,
+    twoFactorApprovedUntil: raw.twoFactorApprovedUntil ?? null,
+    createdAt: raw.createdAt ?? null,
+  };
+}
+
 export async function getUserProfile(uid: string): Promise<UserProfile | null> {
   try {
     const snap = await getDoc(doc(db, 'users', uid));
     if (snap.exists()) {
-      return snap.data() as UserProfile;
+      return normalizeUserProfile(snap.data() as Partial<UserProfile>, uid);
     }
     return null;
   } catch (error) {
     console.error('Error fetching user profile:', error);
     return null;
   }
+}
+
+export function subscribeToUserProfile(
+  uid: string,
+  onData: (profile: UserProfile | null) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const unsub = onSnapshot(
+    doc(db, 'users', uid),
+    (snap) => {
+      if (snap.exists()) {
+        onData(normalizeUserProfile(snap.data() as Partial<UserProfile>, uid));
+      } else {
+        onData(null);
+      }
+    },
+    (error) => {
+      if (onError) {
+        try {
+          handleFirestoreError(error, OperationType.GET, `users/${uid}`);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    }
+  );
+  return trackFirestoreListener(unsub);
 }
 
 export async function initializeUserProfile(user: {
@@ -145,13 +195,29 @@ export async function initializeUserProfile(user: {
   const isAdminEmail = email === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
   const defaultRole: UserRole = isAdminEmail ? 'administrator' : 'user';
 
-  const existing = await getUserProfile(user.uid);
-  if (existing) {
-    if (isAdminEmail && existing.role !== 'administrator') {
-      await updateUserRole(user.uid, 'administrator');
-      existing.role = 'administrator';
+  const existingSnap = await getDoc(doc(db, 'users', user.uid));
+  if (existingSnap.exists()) {
+    const rawData = existingSnap.data() as Partial<UserProfile>;
+    const normalized = normalizeUserProfile(rawData, user.uid);
+
+    // Backfill mandatory 2FA governance fields on legacy user documents
+    if (!('twoFactorLocked' in rawData) || !('twoFactorEnabled' in rawData)) {
+      try {
+        await updateDoc(doc(db, 'users', user.uid), {
+          twoFactorEnabled: false,
+          twoFactorLocked: true,
+          twoFactorApprovedUntil: null,
+        });
+      } catch (err) {
+        console.error('Failed to backfill 2FA governance fields:', err);
+      }
     }
-    return existing;
+
+    if (isAdminEmail && normalized.role !== 'administrator') {
+      await updateUserRole(user.uid, 'administrator');
+      normalized.role = 'administrator';
+    }
+    return normalized;
   }
 
   // Check if there is a client with matching email
@@ -174,6 +240,9 @@ export async function initializeUserProfile(user: {
     displayName: user.displayName || email.split('@')[0] || 'Taxpayer',
     role: defaultRole,
     assignedClientId: assignedClientId || null,
+    twoFactorEnabled: false,
+    twoFactorLocked: true,
+    twoFactorApprovedUntil: null,
     createdAt: Timestamp.now(),
   };
 
@@ -187,7 +256,15 @@ export async function initializeUserProfile(user: {
 
 export async function updateUserRole(uid: string, role: UserRole): Promise<void> {
   try {
-    await updateDoc(doc(db, 'users', uid), { role });
+    const userRef = doc(db, 'users', uid);
+    const snap = await getDoc(userRef);
+    const raw = snap.exists() ? (snap.data() as Partial<UserProfile>) : {};
+    await updateDoc(userRef, {
+      role,
+      twoFactorEnabled: Boolean(raw.twoFactorEnabled),
+      twoFactorLocked: raw.twoFactorLocked !== false,
+      twoFactorApprovedUntil: raw.twoFactorApprovedUntil ?? null,
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
   }
@@ -196,7 +273,9 @@ export async function updateUserRole(uid: string, role: UserRole): Promise<void>
 export async function getAllUserProfiles(): Promise<UserProfile[]> {
   try {
     const snap = await getDocs(collection(db, 'users'));
-    return snap.docs.map((d) => d.data() as UserProfile);
+    return snap.docs.map((d) =>
+      normalizeUserProfile(d.data() as Partial<UserProfile>, d.id)
+    );
   } catch (error) {
     console.error('Error fetching user profiles:', error);
     return [];
@@ -739,8 +818,295 @@ export async function deleteTaxClient(clientId: string): Promise<void> {
   }
 }
 
+/**
+ * Permanently purges a client record and its nested verifications/reminders subcollections.
+ * Strictly NEVER touches the immutable audit_logs collection.
+ */
+export async function purgeClientRecord(clientId: string): Promise<{
+  deletedVerifications: number;
+  deletedReminders: number;
+}> {
+  const path = `clients/${clientId}`;
+  try {
+    const verifSnaps = await getDocs(collection(db, `clients/${clientId}/verifications`));
+    const remSnaps = await getDocs(collection(db, `clients/${clientId}/reminders`));
+
+    const allRefs = [
+      ...verifSnaps.docs.map((d) => d.ref),
+      ...remSnaps.docs.map((d) => d.ref),
+      doc(db, 'clients', clientId),
+    ];
+
+    const chunkSize = 400;
+    for (let i = 0; i < allRefs.length; i += chunkSize) {
+      const batch = writeBatch(db);
+      for (const ref of allRefs.slice(i, i + chunkSize)) {
+        batch.delete(ref);
+      }
+      await batch.commit();
+    }
+
+    return {
+      deletedVerifications: verifSnaps.size,
+      deletedReminders: remSnaps.size,
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Server-Side Gemini 2.5 Flash API Helpers
+// Danger Zone: 2FA Governance & Global Security Policy
+// ---------------------------------------------------------------------------
+export async function createTwoFactorChangeRequest(params: {
+  requestType: TwoFactorRequestType;
+  reason: string;
+  requesterRole: UserRole;
+}): Promise<string> {
+  const user = auth.currentUser;
+  if (!user || !user.email) {
+    throw new Error('You must be signed in to submit a 2FA change request.');
+  }
+
+  const trimmedReason = clampString(params.reason, 500);
+  if (trimmedReason.length < 5) {
+    throw new Error('Please provide a clear justification (at least 5 characters).');
+  }
+
+  try {
+    const ref = await addDoc(collection(db, 'two_factor_requests'), {
+      requesterUid: user.uid,
+      requesterEmail: user.email.toLowerCase().trim(),
+      requesterRole: params.requesterRole,
+      requestType: params.requestType,
+      reason: trimmedReason,
+      status: 'PENDING',
+      createdAt: serverTimestamp(),
+      reviewedByUid: null,
+      reviewedByEmail: null,
+      reviewedAt: null,
+    });
+    return ref.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, 'two_factor_requests');
+  }
+}
+
+export function subscribeToMyTwoFactorRequests(
+  uid: string,
+  onData: (requests: TwoFactorChangeRequest[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, 'two_factor_requests'),
+    where('requesterUid', '==', uid)
+  );
+  const unsub = onSnapshot(
+    q,
+    (snap) => {
+      const items: TwoFactorChangeRequest[] = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<TwoFactorChangeRequest, 'id'>),
+      }));
+      items.sort(
+        (a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0)
+      );
+      onData(items);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, 'two_factor_requests');
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+  return trackFirestoreListener(unsub);
+}
+
+export function subscribeToAllTwoFactorRequests(
+  onData: (requests: TwoFactorChangeRequest[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, 'two_factor_requests'),
+    orderBy('createdAt', 'desc')
+  );
+  const unsub = onSnapshot(
+    q,
+    (snap) => {
+      const items: TwoFactorChangeRequest[] = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<TwoFactorChangeRequest, 'id'>),
+      }));
+      onData(items);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, 'two_factor_requests');
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+  return trackFirestoreListener(unsub);
+}
+
+export async function reviewTwoFactorChangeRequest(
+  request: TwoFactorChangeRequest,
+  decision: 'APPROVED' | 'REJECTED'
+): Promise<void> {
+  const adminUser = auth.currentUser;
+  if (!adminUser || !adminUser.email) {
+    throw new Error('Administrator authentication is required.');
+  }
+
+  try {
+    const batch = writeBatch(db);
+    const reqRef = doc(db, 'two_factor_requests', request.id);
+    batch.update(reqRef, {
+      status: decision,
+      reviewedByUid: adminUser.uid,
+      reviewedByEmail: adminUser.email.toLowerCase().trim(),
+      reviewedAt: serverTimestamp(),
+    });
+
+    if (decision === 'APPROVED') {
+      const targetUserRef = doc(db, 'users', request.requesterUid);
+      const targetSnap = await getDoc(targetUserRef);
+      const targetData = targetSnap.exists()
+        ? (targetSnap.data() as Partial<UserProfile>)
+        : {};
+      const approvedUntil = Timestamp.fromMillis(Date.now() + 30 * 60 * 1000);
+      batch.update(targetUserRef, {
+        twoFactorEnabled: Boolean(targetData.twoFactorEnabled),
+        twoFactorLocked: false,
+        twoFactorApprovedUntil: approvedUntil,
+      });
+    }
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.WRITE,
+      `two_factor_requests/${request.id}`
+    );
+  }
+}
+
+export async function completeTwoFactorUpdate(params: {
+  uid: string;
+  requestId: string;
+  twoFactorEnabled: boolean;
+}): Promise<void> {
+  try {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'users', params.uid), {
+      twoFactorEnabled: params.twoFactorEnabled,
+      twoFactorLocked: true,
+      twoFactorApprovedUntil: null,
+    });
+    batch.update(doc(db, 'two_factor_requests', params.requestId), {
+      status: 'COMPLETED',
+    });
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `users/${params.uid}`);
+  }
+}
+
+export function subscribeToSecuritySettings(
+  onData: (settings: SystemSecuritySettings) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const unsub = onSnapshot(
+    doc(db, 'system_settings', 'security'),
+    (snap) => {
+      if (snap.exists()) {
+        const raw = snap.data() as Partial<SystemSecuritySettings>;
+        onData({
+          require2faForAdminAndManager: Boolean(raw.require2faForAdminAndManager),
+          updatedByUid: raw.updatedByUid ?? null,
+          updatedByEmail: raw.updatedByEmail ?? null,
+          updatedAt: raw.updatedAt ?? null,
+        });
+      } else {
+        onData({
+          require2faForAdminAndManager: false,
+          updatedByUid: null,
+          updatedByEmail: null,
+          updatedAt: null,
+        });
+      }
+    },
+    (error) => {
+      if (onError) {
+        try {
+          handleFirestoreError(error, OperationType.GET, 'system_settings/security');
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    }
+  );
+  return trackFirestoreListener(unsub);
+}
+
+export async function updateMandatoryTwoFactorPolicy(
+  require2faForAdminAndManager: boolean
+): Promise<void> {
+  const adminUser = auth.currentUser;
+  if (!adminUser || !adminUser.email) {
+    throw new Error('Administrator authentication is required.');
+  }
+  try {
+    await setDoc(doc(db, 'system_settings', 'security'), {
+      require2faForAdminAndManager,
+      updatedByUid: adminUser.uid,
+      updatedByEmail: adminUser.email.toLowerCase().trim(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'system_settings/security');
+  }
+}
+
+export async function setupTwoFactorApi(
+  uid: string,
+  email: string
+): Promise<TwoFactorSetupResponse> {
+  const response = await fetch('/api/2fa/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uid, email }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || 'Failed to generate authenticator QR code.');
+  }
+  return data as TwoFactorSetupResponse;
+}
+
+export async function verifyTwoFactorApi(
+  uid: string,
+  code: string,
+  action?: 'bind' | 'verify' | 'clear'
+): Promise<{ valid: boolean; bound?: boolean; cleared?: boolean; error?: string }> {
+  const response = await fetch('/api/2fa/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uid, code, action }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || 'Authenticator verification failed.');
+  }
+  return data as { valid: boolean; bound?: boolean; cleared?: boolean; error?: string };
+}
+
+// ---------------------------------------------------------------------------
+// Server-Side Gemini API Helpers
 // ---------------------------------------------------------------------------
 export async function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {

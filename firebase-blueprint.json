@@ -31,12 +31,30 @@
           "minLength": 3,
           "maxLength": 64
         },
+        "twoFactorEnabled": {
+          "type": "boolean"
+        },
+        "twoFactorLocked": {
+          "type": "boolean"
+        },
+        "twoFactorApprovedUntil": {
+          "type": "string",
+          "format": "date-time"
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
         }
       },
-      "required": ["uid", "email", "displayName", "role", "createdAt"]
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "role",
+        "twoFactorEnabled",
+        "twoFactorLocked",
+        "createdAt"
+      ]
     },
     "TaxClient": {
       "title": "TaxClient",
@@ -307,12 +325,109 @@
         "actionTaken",
         "details"
       ]
+    },
+    "TwoFactorChangeRequest": {
+      "title": "TwoFactorChangeRequest",
+      "description": "Governance approval request required before any user may disable, reset, or modify 2FA settings.",
+      "type": "object",
+      "properties": {
+        "requesterUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "requesterRole": {
+          "type": "string",
+          "enum": ["administrator", "manager", "user"]
+        },
+        "requestType": {
+          "type": "string",
+          "enum": ["DISABLE_2FA", "RESET_2FA_SECRET", "CHANGE_2FA_METHOD"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "APPROVED", "REJECTED", "COMPLETED"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reviewedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reviewedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requesterUid",
+        "requesterEmail",
+        "requesterRole",
+        "requestType",
+        "reason",
+        "status",
+        "createdAt"
+      ]
+    },
+    "SystemSecuritySettings": {
+      "title": "SystemSecuritySettings",
+      "description": "Global firm-wide security policies managed exclusively by System Administrators.",
+      "type": "object",
+      "properties": {
+        "require2faForAdminAndManager": {
+          "type": "boolean"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "require2faForAdminAndManager",
+        "updatedByUid",
+        "updatedByEmail",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
     "/users/{uid}": {
       "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "User profiles and RBAC role assignments."
+      "description": "User profiles, RBAC role assignments, and 2FA lock states."
     },
     "/clients/{clientId}": {
       "schema": { "$ref": "#/entities/TaxClient" },
@@ -320,7 +435,7 @@
     },
     "/clients/{clientId}/verifications/{verificationId}": {
       "schema": { "$ref": "#/entities/DocumentVerification" },
-      "description": "Audit trail of Gemini 2.5 Flash document verification runs for a client."
+      "description": "Audit trail of Gemini document verification runs for a client."
     },
     "/clients/{clientId}/reminders/{reminderId}": {
       "schema": { "$ref": "#/entities/ReminderLog" },
@@ -328,7 +443,15 @@
     },
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLogEntry" },
-      "description": "Immutable append-only activity log recording user navigation, uploads, verifications, status changes, assignments, reminders, and role changes."
+      "description": "Immutable append-only activity log recording user navigation, uploads, verifications, status changes, assignments, reminders, 2FA governance, and role changes."
+    },
+    "/two_factor_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/TwoFactorChangeRequest" },
+      "description": "Approval workflow requests for modifying locked Two-Factor Authentication settings."
+    },
+    "/system_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSecuritySettings" },
+      "description": "Global system security settings (e.g., /system_settings/security)."
     }
   }
 }
